@@ -3,6 +3,7 @@
 """Interactive Command-Line Interface and headless daemon for OpenEasySync."""
 
 import argparse
+import logging
 import os
 import sys
 import time
@@ -111,13 +112,22 @@ def cmd_ls(args) -> int:
             roots = transfer.query_roots()
             print(f"{'Drive / Root':<20} {'Type':<12} {'Total Size':<15} {'Free Space':<15}")
             print("-" * 65)
+            drive_types = {
+                0: "Unknown",
+                1: "NoRoot",
+                2: "Removable",
+                3: "Fixed",
+                4: "Remote",
+                5: "CD-ROM",
+                6: "RAMDisk",
+            }
             for r in roots:
-                tot_gb = r.total_bytes / (1024**3)
-                free_gb = r.total_free_bytes / (1024**3)
-                print(
-                    f"{r.find_data.filename:<20} {'Drive':<12} {tot_gb:>10.2f} GB"
-                    f" {free_gb:>10.2f} GB"
+                tot_str = f"{r.total_bytes / (1024**3):>10.2f} GB" if r.total_bytes > 0 else "-"
+                free_str = (
+                    f"{r.total_free_bytes / (1024**3):>10.2f} GB" if r.total_free_bytes > 0 else "-"
                 )
+                dtype_name = drive_types.get(r.drive_type, "Drive")
+                print(f"{r.find_data.filename:<20} {dtype_name:<12} {tot_str:>15} {free_str:>15}")
         else:
             entries = transfer.list_dir(remote_path)
             print(f"{'Name':<35} {'Size (Bytes)':<15} {'Type':<10}")
@@ -210,6 +220,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Specify device identifier (e.g. '1:4', '0', or '/dev/sg1'). Default: auto-select first available",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        "--debug",
+        action="store_true",
+        dest="debug",
+        help="Enable verbose debug logging",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # devices
@@ -246,6 +264,11 @@ def main(argv: list[str] | None = None) -> int:
     p_get.set_defaults(func=cmd_get)
 
     parsed_args = parser.parse_args(argv)
+    if parsed_args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
     return parsed_args.func(parsed_args)
 
 
