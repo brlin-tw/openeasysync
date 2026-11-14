@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Link and pipe polling 3-state machine running on a background worker thread."""
 
+import logging
 import queue
 import threading
 import time
@@ -19,6 +20,8 @@ from openeasysync.constants import (
     BULK_BLOCK_SIZE,
 )
 from openeasysync.transport.base import TransportBackend
+
+logger = logging.getLogger("openeasysync.poller")
 
 
 class LinkPoller:
@@ -80,7 +83,8 @@ class LinkPoller:
             try:
                 if self.state == 0:
                     self._state_poll()
-            except Exception:
+            except Exception as exc:
+                logger.debug("Exception in poller loop: %s", exc)
                 time.sleep(self.poll_interval_s)
 
     def _state_poll(self) -> None:
@@ -88,16 +92,20 @@ class LinkPoller:
         local_queued = min(self.tx_queue.qsize(), self.max_blocks_per_burst)
         action_code, remote_blocks, _, _ = self.transport.poll_link(local_queued)
 
-        if action_code in (ACTION_IDLE_0, ACTION_IDLE_1):
-            time.sleep(self.poll_interval_s)
+        logger.debug(
+            "Poll link: action_code=%d, remote_blocks=%d, tx_queued=%d",
+            action_code,
+            remote_blocks,
+            self.tx_queue.qsize(),
+        )
 
-        elif action_code == ACTION_REMOTE_BULK:
+        if action_code == ACTION_REMOTE_BULK:
             # State 2: Remote has bulk blocks to read
             self.state = 2
             self._state_bulk_read(max(1, remote_blocks))
 
         elif action_code in (ACTION_READY_WRITE_SINGLE, ACTION_READY_WRITE_BURST):
-            # State 1: Bridge ready for bulk write
+            # State 1: Bridge explicitly ready for bulk write
             count = (
                 1
                 if action_code == ACTION_READY_WRITE_SINGLE
@@ -106,6 +114,19 @@ class LinkPoller:
             if count > 0 and not self.tx_queue.empty():
                 self.state = 1
                 self._state_bulk_write(count)
+
+        elif action_code in (ACTION_IDLE_0, ACTION_IDLE_1):
+            # Idle / Link Ready: if local host has queued TX blocks, initiate write
+            # as usbnic.sys does at 0x00011675
+            if not self.tx_queue.empty():
+                count = min(self.tx_queue.qsize(), self.max_blocks_per_burst)
+                if count > 0:
+                    self.state = 1
+                    self._state_bulk_write(count)
+                else:
+                    time.sleep(self.poll_interval_s)
+            else:
+                time.sleep(self.poll_interval_s)
 
         elif action_code == ACTION_PEER_EVENT:
             if self.on_peer_event:
@@ -128,11 +149,18 @@ class LinkPoller:
                     block = self.tx_queue.get_nowait()
                 except queue.Empty:
                     break
+                logger.debug(
+                    "Transmitting bulk block %d/%d (%d bytes)...",
+                    sent + 1,
+                    count,
+                    len(block),
+                )
                 self.transport.write_bulk_block(block)
                 sent += 1
                 if self.on_activity:
                     self.on_activity()
-        except Exception:
+        except Exception as exc:
+            logger.warning("Error during bulk write: %s; flushing pipes", exc)
             self.transport.flush_pipes()
         finally:
             self.state = 0
@@ -142,12 +170,13 @@ class LinkPoller:
         read_count = 0
         try:
             while read_count < count:
+                logger.debug("Reading bulk block %d/%d...", read_count + 1, count)
                 block = self.transport.read_bulk_block()
                 self.rx_queue.put(block)
                 read_count += 1
                 if self.on_activity:
                     self.on_activity()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Error during bulk read: %s", exc)
         finally:
             self.state = 0
