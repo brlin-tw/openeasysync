@@ -162,3 +162,25 @@ def test_e2e_transfer_cancel(dual_host_setup):
     transfer_a = dual_host_setup["transfer_a"]
     res = transfer_a.cancel_transfer()
     assert res is True
+
+
+def test_query_roots_wire_format_reply_roots():
+    """Verify TransferManager.query_roots parses 0xA4 roots reply correctly."""
+    from unittest.mock import MagicMock
+
+    from openeasysync.constants import FILE_ATTRIBUTE_DIRECTORY
+    from openeasysync.protocol.replies import encode_roots_reply
+
+    mock_session = MagicMock()
+    mock_session.send_command.return_value = encode_roots_reply([("C", 3), ("D", 2)])
+    transfer = TransferManager(mock_session)
+
+    roots = transfer.query_roots()
+    assert len(roots) == 2
+    assert roots[0].find_data.filename == "C:\\"
+    assert roots[0].find_data.file_attributes == FILE_ATTRIBUTE_DIRECTORY
+    assert roots[0].is_drive is True
+    assert roots[0].drive_type == 3
+
+    assert roots[1].find_data.filename == "D:\\"
+    assert roots[1].drive_type == 2

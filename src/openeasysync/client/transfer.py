@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 from openeasysync.client.session import SessionManager
 from openeasysync.constants import (
+    ENTRY_KIND_DRIVE,
+    FILE_ATTRIBUTE_DIRECTORY,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
     REPLY_DOWNLOAD_SINGLE,
@@ -63,9 +65,11 @@ class TransferManager:
         if rep["opcode"] == REPLY_ROOTS:
             entries: list[Entry552] = []
             for letter, dtype in rep["roots"]:
-                fd = Win32FindData(filename=f"{letter}:\\", attributes=0x10)
+                fd = Win32FindData(
+                    filename=f"{letter}:\\", file_attributes=FILE_ATTRIBUTE_DIRECTORY
+                )
                 entry = Entry552(
-                    entry_kind=0,
+                    entry_kind=ENTRY_KIND_DRIVE,
                     find_data=fd,
                     drive_type=dtype,
                     total_bytes=0,
