@@ -77,17 +77,11 @@ class PyUsbTransport(TransportBackend):
             pass
 
         try:
-            cfg = dev.get_active_configuration()
+            dev.set_configuration()
         except Exception:
-            cfg = None
+            pass
 
-        if cfg is None:
-            try:
-                dev.set_configuration()
-            except Exception:
-                pass
-            cfg = dev.get_active_configuration()
-
+        cfg = dev.get_active_configuration()
         intf = cfg[(0, 0)]
 
         ep_out = usb.util.find_descriptor(
@@ -119,13 +113,6 @@ class PyUsbTransport(TransportBackend):
                 f"Cannot claim interface {intf.bInterfaceNumber} on USB device "
                 f"(Bus {dev.bus} Device {dev.address}): device is already opened or busy: {exc}"
             ) from exc
-
-        # Clear any residual halt condition left on the bulk endpoints from previous aborted runs
-        try:
-            self.dev.clear_halt(self.ep_in)
-            self.dev.clear_halt(self.ep_out)
-        except Exception:
-            pass
 
     def reset_recovery(self) -> None:
         """Performs USB BOT Reset Recovery (Spec Section 5.3.4)."""
@@ -169,7 +156,19 @@ class PyUsbTransport(TransportBackend):
 
         # 1. Write CBW
         cbw = wrap_bot_cbw(cdb, transfer_len, direction_in=is_in, tag=tag)
-        self.ep_out.write(cbw, timeout=timeout_ms)
+        try:
+            self.ep_out.write(cbw, timeout=timeout_ms)
+        except Exception as exc:
+            # If writing CBW times out or stalls, perform BOT Reset Recovery and retry once
+            if (
+                getattr(exc, "errno", None) in (32, 110)
+                or "time" in str(exc).lower()
+                or "pipe" in str(exc).lower()
+            ):
+                self.reset_recovery()
+                self.ep_out.write(cbw, timeout=timeout_ms)
+            else:
+                raise
 
         # 2. Data Stage
         data_in = b""

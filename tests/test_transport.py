@@ -137,10 +137,8 @@ def test_pyusb_transport_data_stall_and_recovery():
     ):
         transport = PyUsbTransport(dev=mock_dev)
 
-    # Verify initial halt clear
-    mock_dev.clear_halt.assert_any_call(ep_in)
-    mock_dev.clear_halt.assert_any_call(ep_out)
-    mock_dev.clear_halt.reset_mock()
+    # Verify set_configuration is called on setup to synchronize data toggles
+    mock_dev.set_configuration.assert_called_once()
 
     # Simulate STALL on data read, followed by CSW reporting failure
     pipe_err = usb.core.USBError("Pipe error", -9, 32)
