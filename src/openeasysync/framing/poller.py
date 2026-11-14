@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Link and pipe polling 3-state machine running on a background worker thread."""
 
+import collections
 import logging
 import queue
 import threading
@@ -41,13 +42,34 @@ class LinkPoller:
         self.on_peer_event = on_peer_event
         self.on_activity = on_activity
 
-        self.tx_queue: queue.Queue[bytes] = queue.Queue(maxsize=128)
+        self._tx_deque: collections.deque[bytes] = collections.deque()
         self.rx_queue: queue.Queue[bytes] = queue.Queue(maxsize=128)
 
         self._running = False
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self.state: int = 0  # 0: Poll, 1: Bulk Write, 2: Bulk Read
+
+    @property
+    def tx_queue(self):
+        """Backward-compatible proxy for inspect/querying tx queue state."""
+
+        class _QueueProxy:
+            def __init__(proxy_self):
+                pass
+
+            def qsize(proxy_self) -> int:
+                with self._lock:
+                    return len(self._tx_deque)
+
+            def empty(proxy_self) -> bool:
+                with self._lock:
+                    return len(self._tx_deque) == 0
+
+            def put(proxy_self, item: bytes) -> None:
+                self.enqueue_tx(item)
+
+        return _QueueProxy()
 
     def start(self) -> None:
         """Starts the background poller thread."""
@@ -71,7 +93,8 @@ class LinkPoller:
         """Enqueues a 64 KB block to be transmitted."""
         if len(block) != BULK_BLOCK_SIZE:
             block = block.ljust(BULK_BLOCK_SIZE, b"\x00")[:BULK_BLOCK_SIZE]
-        self.tx_queue.put(block)
+        with self._lock:
+            self._tx_deque.append(block)
 
     def dequeue_rx(self, timeout: float | None = 5.0) -> bytes:
         """Dequeues a received 64 KB block, waiting up to timeout seconds."""
@@ -89,14 +112,16 @@ class LinkPoller:
 
     def _state_poll(self) -> None:
         """State 0: Issues 0xD8 0x00 op_type=3 and transitions based on action_code."""
-        local_queued = min(self.tx_queue.qsize(), self.max_blocks_per_burst)
+        with self._lock:
+            tx_count = len(self._tx_deque)
+        local_queued = min(tx_count, self.max_blocks_per_burst)
         action_code, remote_blocks, _, _ = self.transport.poll_link(local_queued)
 
         logger.debug(
             "Poll link: action_code=%d, remote_blocks=%d, tx_queued=%d",
             action_code,
             remote_blocks,
-            self.tx_queue.qsize(),
+            tx_count,
         )
 
         if action_code == ACTION_REMOTE_BULK:
@@ -111,15 +136,17 @@ class LinkPoller:
                 if action_code == ACTION_READY_WRITE_SINGLE
                 else min(local_queued, self.max_blocks_per_burst)
             )
-            if count > 0 and not self.tx_queue.empty():
+            if count > 0 and tx_count > 0:
                 self.state = 1
                 self._state_bulk_write(count)
+            else:
+                time.sleep(self.poll_interval_s)
 
         elif action_code in (ACTION_IDLE_0, ACTION_IDLE_1):
             # Idle / Link Ready: if local host has queued TX blocks, initiate write
             # as usbnic.sys does at 0x00011675
-            if not self.tx_queue.empty():
-                count = min(self.tx_queue.qsize(), self.max_blocks_per_burst)
+            if tx_count > 0:
+                count = min(tx_count, self.max_blocks_per_burst)
                 if count > 0:
                     self.state = 1
                     self._state_bulk_write(count)
@@ -144,24 +171,33 @@ class LinkPoller:
         """State 1: Sends up to `count` 64 KB blocks from TX queue."""
         sent = 0
         try:
-            while sent < count and not self.tx_queue.empty():
-                try:
-                    block = self.tx_queue.get_nowait()
-                except queue.Empty:
-                    break
+            while sent < count:
+                with self._lock:
+                    if not self._tx_deque:
+                        break
+                    block = self._tx_deque.popleft()
+
                 logger.debug(
                     "Transmitting bulk block %d/%d (%d bytes)...",
                     sent + 1,
                     count,
                     len(block),
                 )
-                self.transport.write_bulk_block(block)
-                sent += 1
-                if self.on_activity:
-                    self.on_activity()
-        except Exception as exc:
-            logger.warning("Error during bulk write: %s; flushing pipes", exc)
-            self.transport.flush_pipes()
+                try:
+                    self.transport.write_bulk_block(block)
+                    sent += 1
+                    if self.on_activity:
+                        self.on_activity()
+                except Exception as exc:
+                    # Do NOT discard the block on write failure; requeue at the front for retry
+                    with self._lock:
+                        self._tx_deque.appendleft(block)
+                    logger.debug(
+                        "Transient error during bulk write (%s); requeued block for retry",
+                        exc,
+                    )
+                    time.sleep(self.poll_interval_s)
+                    break
         finally:
             self.state = 0
 

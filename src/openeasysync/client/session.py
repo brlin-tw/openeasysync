@@ -80,6 +80,7 @@ class SessionManager:
 
         # 6. Enter Transfer Line Mode (0x007F)
         self.transport.set_mode(MODE_TRANSFER_LINE)
+        time.sleep(0.05)
 
         # 7. Start Poller and Dispatcher
         self._running = True

@@ -2,10 +2,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Unit tests for 20-byte Bulk Block Header, PacketSplitter, and PacketReassembler."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
-from openeasysync.constants import BULK_BLOCK_SIZE, MAX_PAYLOAD_PER_BLOCK
+from openeasysync.constants import (
+    ACTION_READY_WRITE_BURST,
+    BULK_BLOCK_SIZE,
+    MAX_PAYLOAD_PER_BLOCK,
+)
 from openeasysync.framing.header import BulkBlockHeader, build_bulk_block, parse_bulk_block
+from openeasysync.framing.poller import LinkPoller
 from openeasysync.framing.reassembler import PacketReassembler
 from openeasysync.framing.splitter import PacketSplitter
 
@@ -142,3 +149,30 @@ def test_packet_reassembler_sequence_mismatch():
 
     with pytest.raises(ValueError, match="msg_seq_id mismatch"):
         reassembler.feed_block(b_bad)
+
+
+def test_link_poller_write_failure_requeues_block():
+    """Verify transient bulk write failures requeue block without dropping or flushing pipes."""
+    mock_transport = MagicMock()
+    # First write raises transient OSError (0x0985 Peer Not Reading), second succeeds
+    mock_transport.write_bulk_block.side_effect = [
+        OSError("Bulk write failed: status=1, OTi Vendor: Peer Not Reading / Waiting for Peer"),
+        None,
+    ]
+    mock_transport.poll_link.return_value = (ACTION_READY_WRITE_BURST, 0, 0, 0)
+
+    poller = LinkPoller(transport=mock_transport, poll_interval_s=0.001)
+    test_block = b"X" * BULK_BLOCK_SIZE
+    poller.enqueue_tx(test_block)
+    assert poller.tx_queue.qsize() == 1
+
+    # First poll triggers State 1, write_bulk_block fails, block must be preserved
+    poller._state_poll()
+    assert poller.tx_queue.qsize() == 1
+    # Verify pipes were NOT flushed
+    mock_transport.flush_pipes.assert_not_called()
+
+    # Second poll triggers State 1, write_bulk_block succeeds, queue emptied
+    poller._state_poll()
+    assert poller.tx_queue.qsize() == 0
+    assert mock_transport.write_bulk_block.call_count == 2

@@ -134,7 +134,7 @@ SENSE_MAP: dict[int, tuple[int, str]] = {
     0x098200: (0x000F, "OTi Vendor: Buffer Overflow / Busy"),
     0x098300: (0x0012, "OTi Vendor: Sequence Mismatch"),
     0x098400: (0x000D, "OTi Vendor: Peer Reset / Aborted"),
-    0x098500: (0x0013, "OTi Vendor: Pipe CRC / Framing Error"),
+    0x098500: (0x0013, "OTi Vendor: Peer Not Reading / Waiting for Peer"),
     0x098600: (0x000E, "OTi Vendor: Peer Mode Conflict"),
     0x098700: (0x0017, "OTi Vendor: FIFO Underrun"),
     0x098800: (0x0018, "OTi Vendor: FIFO Overrun"),
