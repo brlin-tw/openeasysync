@@ -48,6 +48,14 @@ class LinuxSgIoTransport(TransportBackend):
     def __init__(self, device_path: str):
         self.device_path = device_path
         self.fd = os.open(device_path, os.O_RDWR | os.O_NONBLOCK)
+        self._has_lock = False
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._has_lock = True
+        except OSError as exc:
+            os.close(self.fd)
+            self.fd = -1
+            raise OSError(f"Device {device_path} is already in use by another process") from exc
 
     def execute_cdb(
         self,
@@ -111,5 +119,10 @@ class LinuxSgIoTransport(TransportBackend):
 
     def close(self) -> None:
         if self.fd >= 0:
+            if getattr(self, "_has_lock", False):
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
             os.close(self.fd)
             self.fd = -1

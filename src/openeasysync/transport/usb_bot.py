@@ -100,6 +100,17 @@ class PyUsbTransport(TransportBackend):
         self.ep_out = ep_out
         self.ep_in = ep_in
 
+        # Claim the interface exclusively so other processes or VMs know it is in use
+        self._claimed_interface = None
+        try:
+            usb.util.claim_interface(dev, intf.bInterfaceNumber)
+            self._claimed_interface = intf.bInterfaceNumber
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot claim interface {intf.bInterfaceNumber} on USB device "
+                f"(Bus {dev.bus} Device {dev.address}): device is already opened or busy: {exc}"
+            ) from exc
+
     def execute_cdb(
         self,
         cdb: bytes,
@@ -172,6 +183,12 @@ class PyUsbTransport(TransportBackend):
         try:
             import usb.util
 
+            if getattr(self, "_claimed_interface", None) is not None:
+                try:
+                    usb.util.release_interface(self.dev, self._claimed_interface)
+                except Exception:
+                    pass
+                self._claimed_interface = None
             usb.util.dispose_resources(self.dev)
         except Exception:
             pass

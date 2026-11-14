@@ -10,14 +10,34 @@ import time
 from openeasysync.client.session import SessionManager
 from openeasysync.client.transfer import TransferManager
 from openeasysync.constants import SPEED_USB20
-from openeasysync.transport.detector import detect_device
+from openeasysync.transport.detector import detect_device, list_connected_devices
+
+
+def cmd_devices(args) -> int:
+    """Lists all connected OTi-2108 devices and their availability status."""
+    devs = list_connected_devices()
+    if not devs:
+        print("No OTi-2108 devices found on USB or SCSI bus.")
+        return 0
+
+    print(f"Found {len(devs)} OTi-2108 device endpoint(s):")
+    print(f"{'#':<3} {'Backend':<8} {'Spec':<16} {'Status':<35} {'Description'}")
+    print("-" * 80)
+    for d in devs:
+        avail_marker = "[AVAILABLE]" if d["is_available"] else "[BUSY/IN-USE]"
+        status_disp = f"{avail_marker} {d['status']}"
+        print(
+            f"[{d['index']}] {d['backend']:<8} {d['spec']:<16} {status_disp:<35} {d['description']}"
+        )
+    return 0
 
 
 def cmd_info(args) -> int:
     """Displays hardware identification and link speed information."""
-    transport = detect_device()
+    device_spec = getattr(args, "device", None)
+    transport = detect_device(device_spec)
     if not transport:
-        print("Error: No OTi-2108 device detected on USB or SCSI bus.", file=sys.stderr)
+        print("Error: No available OTi-2108 device detected on USB or SCSI bus.", file=sys.stderr)
         return 1
 
     with transport:
@@ -52,9 +72,10 @@ def cmd_info(args) -> int:
 
 def cmd_daemon(args) -> int:
     """Runs OpenEasySync in headless background daemon mode to service transfers."""
-    transport = detect_device()
+    device_spec = getattr(args, "device", None)
+    transport = detect_device(device_spec)
     if not transport:
-        print("Error: No OTi-2108 device detected.", file=sys.stderr)
+        print("Error: No available OTi-2108 device detected.", file=sys.stderr)
         return 1
 
     session = SessionManager(transport)
@@ -74,9 +95,10 @@ def cmd_daemon(args) -> int:
 
 def cmd_ls(args) -> int:
     """Lists files and folders on the remote peer."""
-    transport = detect_device()
+    device_spec = getattr(args, "device", None)
+    transport = detect_device(device_spec)
     if not transport:
-        print("Error: No OTi-2108 device detected.", file=sys.stderr)
+        print("Error: No available OTi-2108 device detected.", file=sys.stderr)
         return 1
 
     session = SessionManager(transport)
@@ -93,7 +115,8 @@ def cmd_ls(args) -> int:
                 tot_gb = r.total_bytes / (1024**3)
                 free_gb = r.total_free_bytes / (1024**3)
                 print(
-                    f"{r.find_data.filename:<20} {'Drive':<12} {tot_gb:>10.2f} GB {free_gb:>10.2f} GB"
+                    f"{r.find_data.filename:<20} {'Drive':<12} {tot_gb:>10.2f} GB"
+                    f" {free_gb:>10.2f} GB"
                 )
         else:
             entries = transfer.list_dir(remote_path)
@@ -113,9 +136,10 @@ def cmd_ls(args) -> int:
 
 def cmd_put(args) -> int:
     """Uploads a local file or directory to remote peer."""
-    transport = detect_device()
+    device_spec = getattr(args, "device", None)
+    transport = detect_device(device_spec)
     if not transport:
-        print("Error: No OTi-2108 device detected.", file=sys.stderr)
+        print("Error: No available OTi-2108 device detected.", file=sys.stderr)
         return 1
 
     session = SessionManager(transport)
@@ -147,9 +171,10 @@ def cmd_put(args) -> int:
 
 def cmd_get(args) -> int:
     """Downloads a remote file or directory to local destination."""
-    transport = detect_device()
+    device_spec = getattr(args, "device", None)
+    transport = detect_device(device_spec)
     if not transport:
-        print("Error: No OTi-2108 device detected.", file=sys.stderr)
+        print("Error: No available OTi-2108 device detected.", file=sys.stderr)
         return 1
 
     session = SessionManager(transport)
@@ -179,7 +204,19 @@ def main(argv: list[str] | None = None) -> int:
         prog="openeasysync",
         description="OpenEasySync: OTi-2108 Cross-Platform File Transfer Companion Application",
     )
+    parser.add_argument(
+        "-d",
+        "--device",
+        default=None,
+        help="Specify device identifier (e.g. '1:4', '0', or '/dev/sg1'). Default: auto-select first available",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # devices
+    p_devs = subparsers.add_parser(
+        "devices", help="List all connected OTi-2108 devices and availability"
+    )
+    p_devs.set_defaults(func=cmd_devices)
 
     # info
     p_info = subparsers.add_parser("info", help="Display hardware identification and status")
