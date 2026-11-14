@@ -102,3 +102,4 @@ dist/
 
 # Don't track unpacked product files
 /openeasysync-*/
+crash dump/
