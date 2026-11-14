@@ -106,3 +106,59 @@ def test_mock_bridge_cable_loopback():
 
     host_a.close()
     host_b.close()
+
+
+def test_pyusb_transport_data_stall_and_recovery():
+    """Verify PyUsbTransport handles endpoint stall, clears halt, and reads CSW."""
+    from unittest.mock import MagicMock, patch
+
+    import usb.core
+
+    from openeasysync.constants import CSW_STATUS_FAILED
+    from openeasysync.transport.usb_bot import PyUsbTransport
+
+    mock_dev = MagicMock()
+    mock_dev.bus = 1
+    mock_dev.address = 2
+    mock_dev.is_kernel_driver_active.return_value = False
+    mock_intf = MagicMock()
+    mock_intf.bInterfaceNumber = 0
+    mock_cfg = {(0, 0): mock_intf}
+    mock_dev.get_active_configuration.return_value = mock_cfg
+
+    ep_out = MagicMock()
+    ep_out.bEndpointAddress = 0x02  # OUT
+    ep_in = MagicMock()
+    ep_in.bEndpointAddress = 0x81  # IN
+
+    with (
+        patch("usb.util.find_descriptor", side_effect=[ep_out, ep_in]),
+        patch("usb.util.claim_interface"),
+    ):
+        transport = PyUsbTransport(dev=mock_dev)
+
+    # Verify initial halt clear
+    mock_dev.clear_halt.assert_any_call(ep_in)
+    mock_dev.clear_halt.assert_any_call(ep_out)
+    mock_dev.clear_halt.reset_mock()
+
+    # Simulate STALL on data read, followed by CSW reporting failure
+    pipe_err = usb.core.USBError("Pipe error", -9, 32)
+    ep_in.read.side_effect = [
+        pipe_err,  # Data stage stalls with EPIPE
+        struct.pack("<IIIB", USBS_SIGNATURE, OTI_CBW_TAG, 0, CSW_STATUS_FAILED),  # CSW
+        bytes([0x70, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x0A, 0, 0, 0, 0, 0x20, 0x00]),  # Sense
+        struct.pack("<IIIB", USBS_SIGNATURE, OTI_CBW_TAG, 0, CSW_STATUS_PASSED),  # Sense CSW
+    ]
+
+    status, data, sense = transport.execute_cdb(bytes([0xF0] + [0] * 15), "IN", 12)
+    assert status == CSW_STATUS_FAILED
+    assert data == b""
+    # clear_halt should have been called on ep_in to unfreeze endpoint
+    mock_dev.clear_halt.assert_any_call(ep_in)
+    # Sense should be parsed (sk=5, asc=0x20, ascq=0)
+    assert sense == (0x05, 0x20, 0x00)
+
+    # Test reset_recovery
+    transport.reset_recovery()
+    mock_dev.ctrl_transfer.assert_called_with(0x21, 0xFF, 0x0000, 0, b"", timeout=1000)

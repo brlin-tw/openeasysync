@@ -23,9 +23,12 @@ def wrap_bot_cbw(
     tag: int = OTI_CBW_TAG,
     lun: int = 0,
 ) -> bytes:
-    """Wraps a CDB in a standard 31-byte USB BOT Command Block Wrapper (CBW)."""
+    """Wraps a CDB in a standard 31-byte USB BOT Command Block Wrapper (CBW).
+
+    OTi-2108 firmware expects bCBWCBLength=16 and constant dCBWTag=0x08210827.
+    """
     flags = 0x80 if direction_in and transfer_length > 0 else 0x00
-    cdb_len = len(cdb)
+    cdb_len = max(len(cdb), 16)
     cdb_padded = cdb.ljust(16, b"\x00")
     header = struct.pack("<IIIBBB", USBC_SIGNATURE, tag, transfer_length, flags, lun, cdb_len)
     return header + cdb_padded
@@ -64,7 +67,7 @@ class PyUsbTransport(TransportBackend):
                 )
 
         self.dev = dev
-        self._tag_counter = OTI_CBW_TAG
+        self._tag = OTI_CBW_TAG
 
         # Detach OS driver if bound
         try:
@@ -74,11 +77,17 @@ class PyUsbTransport(TransportBackend):
             pass
 
         try:
-            dev.set_configuration()
+            cfg = dev.get_active_configuration()
         except Exception:
-            pass
+            cfg = None
 
-        cfg = dev.get_active_configuration()
+        if cfg is None:
+            try:
+                dev.set_configuration()
+            except Exception:
+                pass
+            cfg = dev.get_active_configuration()
+
         intf = cfg[(0, 0)]
 
         ep_out = usb.util.find_descriptor(
@@ -111,16 +120,38 @@ class PyUsbTransport(TransportBackend):
                 f"(Bus {dev.bus} Device {dev.address}): device is already opened or busy: {exc}"
             ) from exc
 
+        # Clear any residual halt condition left on the bulk endpoints from previous aborted runs
+        try:
+            self.dev.clear_halt(self.ep_in)
+            self.dev.clear_halt(self.ep_out)
+        except Exception:
+            pass
+
+    def reset_recovery(self) -> None:
+        """Performs USB BOT Reset Recovery (Spec Section 5.3.4)."""
+        intf_num = self._claimed_interface if self._claimed_interface is not None else 0
+        try:
+            # Bulk-Only Mass Storage Reset: bmRequestType=0x21, bRequest=0xFF
+            self.dev.ctrl_transfer(0x21, 0xFF, 0x0000, intf_num, b"", timeout=1000)
+        except Exception:
+            pass
+        try:
+            self.dev.clear_halt(self.ep_in)
+        except Exception:
+            pass
+        try:
+            self.dev.clear_halt(self.ep_out)
+        except Exception:
+            pass
+
     def execute_cdb(
         self,
         cdb: bytes,
         direction: Literal["NONE", "IN", "OUT"],
         data_or_length: bytes | int = 0,
         timeout_ms: int = 5000,
+        tag: int = OTI_CBW_TAG,
     ) -> tuple[int, bytes, tuple[int, int, int]]:
-        self._tag_counter = (self._tag_counter + 1) & 0xFFFFFFFF
-        tag = self._tag_counter
-
         if direction == "IN":
             transfer_len = int(data_or_length)
             is_in = True
@@ -144,12 +175,45 @@ class PyUsbTransport(TransportBackend):
         data_in = b""
         if transfer_len > 0:
             if is_in:
-                data_in = bytes(self.ep_in.read(transfer_len, timeout=timeout_ms))
+                try:
+                    data_in = bytes(self.ep_in.read(transfer_len, timeout=timeout_ms))
+                except Exception as exc:
+                    # Endpoint STALL during data stage (e.g. pipe error)
+                    if getattr(exc, "errno", None) == 32 or "pipe" in str(exc).lower():
+                        try:
+                            self.dev.clear_halt(self.ep_in)
+                        except Exception:
+                            pass
+                    else:
+                        raise
             else:
-                self.ep_out.write(out_bytes, timeout=timeout_ms)
+                try:
+                    self.ep_out.write(out_bytes, timeout=timeout_ms)
+                except Exception as exc:
+                    if getattr(exc, "errno", None) == 32 or "pipe" in str(exc).lower():
+                        try:
+                            self.dev.clear_halt(self.ep_out)
+                        except Exception:
+                            pass
+                    else:
+                        raise
 
         # 3. Read CSW
-        csw_raw = bytes(self.ep_in.read(13, timeout=timeout_ms))
+        csw_raw = b""
+        try:
+            csw_raw = bytes(self.ep_in.read(13, timeout=timeout_ms))
+        except Exception as exc:
+            # CSW read STALL: clear halt and retry once per BOT Section 5.3
+            if getattr(exc, "errno", None) == 32 or "pipe" in str(exc).lower():
+                try:
+                    self.dev.clear_halt(self.ep_in)
+                    csw_raw = bytes(self.ep_in.read(13, timeout=timeout_ms))
+                except Exception:
+                    self.reset_recovery()
+                    raise
+            else:
+                raise
+
         _, _, status = parse_bot_csw(csw_raw, expected_tag=tag)
 
         # 4. Check sense on failure
@@ -162,8 +226,7 @@ class PyUsbTransport(TransportBackend):
     def _request_sense(self, timeout_ms: int = 2000) -> tuple[int, int, int]:
         """Issues SCSI REQUEST SENSE (03 00 00 00 12 00)."""
         cdb = bytes([0x03, 0x00, 0x00, 0x00, 0x12, 0x00])
-        tag = (self._tag_counter + 1) & 0xFFFFFFFF
-        self._tag_counter = tag
+        tag = OTI_CBW_TAG
         cbw = wrap_bot_cbw(cdb, 18, direction_in=True, tag=tag)
         try:
             self.ep_out.write(cbw, timeout=timeout_ms)
@@ -175,8 +238,12 @@ class PyUsbTransport(TransportBackend):
                 asc = sense_data[12]
                 ascq = sense_data[13]
                 return sk, asc, ascq
-        except Exception:
-            pass
+        except Exception as exc:
+            if getattr(exc, "errno", None) == 32 or "pipe" in str(exc).lower():
+                try:
+                    self.dev.clear_halt(self.ep_in)
+                except Exception:
+                    pass
         return 0, 0, 0
 
     def close(self) -> None:
