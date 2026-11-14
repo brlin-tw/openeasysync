@@ -10,14 +10,11 @@ from collections.abc import Callable
 from openeasysync.constants import (
     MODE_OFFLINE,
     MODE_TRANSFER_LINE,
-    OP_XML_CONTROL,
 )
 from openeasysync.framing.poller import LinkPoller
 from openeasysync.framing.reassembler import PacketReassembler
 from openeasysync.framing.splitter import PacketSplitter
-from openeasysync.protocol.commands import encode_xml_control
 from openeasysync.protocol.path_mapping import PathMapper
-from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
 from openeasysync.server.handler import PeerServerHandler
 from openeasysync.transport.base import TransportBackend
 
@@ -89,22 +86,6 @@ class SessionManager:
         )
         self._dispatcher_thread.start()
 
-        # 8. Send <OTIMSG> CONNECT XML Handshake
-        connect_xml = build_oti_msg(msg_type="COMMAND", command="CONNECT")
-        cmd_bytes = encode_xml_control(connect_xml)
-        try:
-            reply_bytes = self.send_command(cmd_bytes, timeout=0.3)
-            if reply_bytes and reply_bytes[0] == OP_XML_CONTROL:
-                parsed = parse_oti_msg(reply_bytes[5:].decode("ascii", errors="replace"))
-                if parsed.get("command") == "CONNECT":
-                    self._is_connected = True
-                    if self.on_connection_change:
-                        self.on_connection_change(True)
-                    return True
-        except Exception:
-            # Connected anyway if hardware entered 0x007F
-            pass
-
         self._is_connected = True
         if self.on_connection_change:
             self.on_connection_change(True)
@@ -114,12 +95,6 @@ class SessionManager:
         """Cleanly disconnects the session."""
         if not self._running:
             return
-
-        try:
-            disconnect_xml = build_oti_msg(msg_type="COMMAND", command="DISCONNECT")
-            self.send_command(encode_xml_control(disconnect_xml), timeout=1.0)
-        except Exception:
-            pass
 
         try:
             self.transport.set_mode(MODE_OFFLINE)
