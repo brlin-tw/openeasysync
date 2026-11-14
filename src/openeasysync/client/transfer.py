@@ -13,6 +13,7 @@ from openeasysync.constants import (
     REPLY_ERROR_CODE,
     REPLY_LISTING,
     REPLY_PRECHECK_BATCH_EXT,
+    REPLY_ROOTS,
     REPLY_STATUS_ACK,
     STATUS_EXISTS,
     STATUS_OK,
@@ -55,8 +56,23 @@ class TransferManager:
     def query_roots(self) -> list[Entry552]:
         """Queries remote peer root drives/volumes (Opcode 0x01)."""
         cmd = encode_query_root()
-        rep_bytes = self.session.send_command(cmd)
+        rep_bytes = self.session.send_command(
+            cmd, expected_opcodes=(REPLY_ROOTS, REPLY_LISTING, REPLY_ERROR_CODE)
+        )
         rep = decode_reply(rep_bytes)
+        if rep["opcode"] == REPLY_ROOTS:
+            entries: list[Entry552] = []
+            for letter, dtype in rep["roots"]:
+                fd = Win32FindData(filename=f"{letter}:\\", attributes=0x10)
+                entry = Entry552(
+                    entry_kind=0,
+                    find_data=fd,
+                    drive_type=dtype,
+                    total_bytes=0,
+                    total_free_bytes=0,
+                )
+                entries.append(entry)
+            return entries
         if rep["opcode"] == REPLY_LISTING:
             return rep["entries"]
         if rep["opcode"] == REPLY_ERROR_CODE:

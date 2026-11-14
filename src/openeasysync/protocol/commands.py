@@ -47,9 +47,16 @@ class BatchPrecheckExtRecord:
 # Encoders
 
 
-def encode_query_root() -> bytes:
-    """Opcode 0x01: Query Peer Root / Drives."""
-    return bytes([OP_QUERY_ROOT])
+def encode_query_root(path: str = "\\") -> bytes:
+    """Opcode 0x01: Query Peer Root / Drives.
+
+    EasySuite.exe wire format (0x0040d9f8 / 0x0043d479):
+    [0x01][flags:u8][param:u16_le][path_len:u8][path:bytes]
+    Note: EasySuite.exe requires a non-empty path (default: '\\') to pass its
+    sanity check at 0x00440fe9; otherwise it aborts without sending root drives.
+    """
+    path_bytes = path.encode("ascii", errors="replace")
+    return bytes([OP_QUERY_ROOT, 0x00, 0x00, 0x00, len(path_bytes)]) + path_bytes
 
 
 def encode_list_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
@@ -217,7 +224,11 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
     opcode = payload[0]
 
     if opcode == OP_QUERY_ROOT:
-        return {"opcode": OP_QUERY_ROOT}
+        path = ""
+        if len(payload) >= 5:
+            path_len = payload[4]
+            path = payload[5 : 5 + path_len].decode(encoding, errors="replace")
+        return {"opcode": OP_QUERY_ROOT, "path": path}
 
     if opcode in (
         OP_LIST_DIR,

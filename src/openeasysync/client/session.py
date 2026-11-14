@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Session manager coordinating hardware initialization, poller, and wire dispatch."""
 
+import logging
 import queue
 import threading
 import time
@@ -10,6 +11,7 @@ from collections.abc import Callable
 from openeasysync.constants import (
     MODE_OFFLINE,
     MODE_TRANSFER_LINE,
+    REPLY_STATUS_ACK,
 )
 from openeasysync.framing.poller import LinkPoller
 from openeasysync.framing.reassembler import PacketReassembler
@@ -17,6 +19,8 @@ from openeasysync.framing.splitter import PacketSplitter
 from openeasysync.protocol.path_mapping import PathMapper
 from openeasysync.server.handler import PeerServerHandler
 from openeasysync.transport.base import TransportBackend
+
+logger = logging.getLogger("openeasysync.session")
 
 
 class SessionManager:
@@ -112,7 +116,12 @@ class SessionManager:
 
         self.transport.close()
 
-    def send_command(self, cmd_payload: bytes, timeout: float = 10.0) -> bytes:
+    def send_command(
+        self,
+        cmd_payload: bytes,
+        timeout: float = 10.0,
+        expected_opcodes: tuple[int, ...] | None = None,
+    ) -> bytes:
         """Sends a Client Command and synchronously waits for the Server Reply."""
         with self._lock:
             # Drain any stale replies in reply queue
@@ -124,15 +133,41 @@ class SessionManager:
 
             # Split logical command into 64 KB blocks
             blocks = self.splitter.split_message(cmd_payload)
+            logger.debug(
+                "Enqueuing command opcode %#04x (%d bytes across %d blocks)",
+                cmd_payload[0],
+                len(cmd_payload),
+                len(blocks),
+            )
             for block in blocks:
                 self.poller.enqueue_tx(block)
 
             # Wait for Server Reply
-            try:
-                reply = self._reply_queue.get(timeout=timeout)
-                return reply
-            except queue.Empty:
-                raise TimeoutError(f"Timeout waiting for reply to opcode {cmd_payload[0]:#04x}")
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                remaining = timeout - (time.time() - start_time)
+                if remaining <= 0:
+                    break
+                try:
+                    reply = self._reply_queue.get(timeout=remaining)
+                    opcode = reply[0]
+                    # If an intermediate ACK was received but caller expects a specific data reply
+                    if (
+                        expected_opcodes
+                        and opcode == REPLY_STATUS_ACK
+                        and REPLY_STATUS_ACK not in expected_opcodes
+                    ):
+                        logger.debug(
+                            "Received intermediate ACK %#04x, continuing to wait for %s...",
+                            opcode,
+                            [f"{op:#04x}" for op in expected_opcodes],
+                        )
+                        continue
+                    return reply
+                except queue.Empty:
+                    break
+
+            raise TimeoutError(f"Timeout waiting for reply to opcode {cmd_payload[0]:#04x}")
 
     def send_command_multi_reply(self, cmd_payload: bytes, timeout: float = 15.0) -> list[bytes]:
         """Sends a command that expects multiple reply messages (e.g. 0x0C Batch Download)."""
@@ -186,6 +221,7 @@ class SessionManager:
             return
 
         opcode = message[0]
+        logger.debug("Received complete wire message: opcode=%#04x, len=%d", opcode, len(message))
 
         # 1. Server Reply (0xA1..0xAC) -> routes to client waiting thread
         if 0xA1 <= opcode <= 0xAC:

@@ -30,6 +30,7 @@ from openeasysync.constants import (
     REPLY_LISTING,
     REPLY_PRECHECK_BATCH,
     REPLY_PRECHECK_BATCH_EXT,
+    REPLY_ROOTS,
     REPLY_STATUS_ACK,
     STATUS_OK,
 )
@@ -72,6 +73,7 @@ from openeasysync.protocol.replies import (
     encode_listing_reply,
     encode_precheck_batch_ext_reply,
     encode_precheck_batch_reply,
+    encode_roots_reply,
     encode_status_ack,
 )
 from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
@@ -79,9 +81,24 @@ from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
 
 def test_command_encoders_and_decoders():
     """Verify all Client Commands encode and decode correctly."""
-    # 0x01 Query Root
-    c01 = decode_command(encode_query_root())
+    # 0x01 Query Root (default path is "\" for EasySuite.exe compatibility)
+    raw01 = encode_query_root()
+    assert len(raw01) == 6
+    assert raw01 == bytes([OP_QUERY_ROOT, 0x00, 0x00, 0x00, 0x01, ord("\\")])
+    c01 = decode_command(raw01)
     assert c01["opcode"] == OP_QUERY_ROOT
+    assert c01["path"] == "\\"
+
+    # 0x01 Query Root with empty path
+    raw01_empty = encode_query_root("")
+    assert len(raw01_empty) == 5
+    assert raw01_empty == bytes([OP_QUERY_ROOT, 0x00, 0x00, 0x00, 0x00])
+    c01_empty = decode_command(raw01_empty)
+    assert c01_empty["opcode"] == OP_QUERY_ROOT
+    assert c01_empty["path"] == ""
+
+    # Test backwards-compatible 1-byte decode
+    assert decode_command(bytes([OP_QUERY_ROOT]))["opcode"] == OP_QUERY_ROOT
 
     # 0x02 List Dir
     c02 = decode_command(encode_list_dir("C:\\Users\\Guest"))
@@ -196,6 +213,11 @@ def test_reply_encoders_and_decoders():
     assert r_a3["opcode"] == REPLY_LISTING
     assert len(r_a3["entries"]) == 1
     assert r_a3["entries"][0].find_data.filename == "sample.txt"
+
+    # 0xA4 Roots Reply
+    r_roots = decode_reply(encode_roots_reply([("C", 3), ("D", 2)]))
+    assert r_roots["opcode"] == REPLY_ROOTS
+    assert r_roots["roots"] == [("C", 3), ("D", 2)]
 
     # 0xA4 Single Download Reply
     fd = Win32FindData(filename="sample.txt", file_size=4)

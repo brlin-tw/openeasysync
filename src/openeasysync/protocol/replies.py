@@ -18,6 +18,7 @@ from openeasysync.constants import (
     REPLY_LISTING,
     REPLY_PRECHECK_BATCH,
     REPLY_PRECHECK_BATCH_EXT,
+    REPLY_ROOTS,
     REPLY_STATUS_ACK,
     REPLY_UPLOAD_BATCH_ERROR,
     WIN32_FIND_DATA_SIZE,
@@ -64,6 +65,16 @@ def encode_listing_reply(entries: list[Entry552], encoding: str = "utf-8") -> by
     body.extend(struct.pack("<I", len(entries)))
     for e in entries:
         body.extend(e.pack(encoding=encoding))
+    return bytes(body)
+
+
+def encode_roots_reply(drives: list[tuple[str, int]]) -> bytes:
+    """Opcode 0xA4: Root Drive Listing Reply."""
+    body = bytearray([REPLY_ROOTS])
+    body.extend(struct.pack("<H", len(drives)))
+    for letter, dtype in drives:
+        char_b = letter[0].upper().encode("ascii")
+        body.extend([char_b[0], dtype & 0xFF])
     return bytes(body)
 
 
@@ -191,7 +202,22 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             offset += DIR_ENTRY_SIZE
         return {"opcode": REPLY_LISTING, "entries": entries}
 
-    if opcode == REPLY_DOWNLOAD_SINGLE:
+    if opcode in (REPLY_ROOTS, REPLY_DOWNLOAD_SINGLE):
+        # Distinguish between Root Drive Listing (0xA4) and Single File Download (0xA4):
+        # Root Drive Listing format from EasySuite.exe (0x004410a6 / 0x0040f093):
+        # [0xA4][drive_count:u16_le][(letter:u8, type:u8)...] -> max 55 bytes (26 drives)
+        if len(payload) >= 3:
+            drive_count = struct.unpack_from("<H", payload, 1)[0]
+            if drive_count <= 26 and len(payload) == 3 + drive_count * 2:
+                roots: list[tuple[str, int]] = []
+                offset = 3
+                for _ in range(drive_count):
+                    letter_char = chr(payload[offset])
+                    dtype = payload[offset + 1] & 0x0F
+                    roots.append((letter_char, dtype))
+                    offset += 2
+                return {"opcode": REPLY_ROOTS, "roots": roots}
+
         file_size = struct.unpack_from("<I", payload, 1)[0]
         fd = Win32FindData.unpack(payload[5 : 5 + WIN32_FIND_DATA_SIZE], encoding=encoding)
         data_start = 5 + WIN32_FIND_DATA_SIZE
