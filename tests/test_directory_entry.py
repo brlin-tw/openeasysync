@@ -78,3 +78,10 @@ def test_entry552_file_and_dir_pack_unpack():
     assert unpacked_d.is_dir is True
     assert unpacked_d.is_file is False
     assert unpacked_d.filename == "SubFolder"
+
+    # 3. Small file (boot.ini: 211 bytes) and large file (> 4 GB) size roundtrip
+    for expected_size in (211, 47564, 250048, 5368709120):
+        entry = make_file_entry("size_test.bin", size=expected_size)
+        raw = entry.pack()
+        unpacked = Entry552.unpack(raw)
+        assert unpacked.file_size == expected_size

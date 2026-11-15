@@ -202,21 +202,17 @@ class Entry552:
 
     def pack(self, encoding: str = "utf-16le") -> bytes:
         """Packs into exactly 552 bytes according to WIN32_FIND_DATAW layout."""
-        size_high = (self.file_size >> 32) & 0xFFFFFFFF
-        size_low = self.file_size & 0xFFFFFFFF
-
         fn_encoded = self.filename.encode("utf-16le")[:512]
         c_file_name_len = len(fn_encoded)
         fn_field = fn_encoded.ljust(512, b"\x00")
 
         header = struct.pack(
-            "<IQQQIII",
+            "<IQQQQI",
             self.file_attributes,
             self.creation_time,
             self.last_access_time,
             self.last_write_time,
-            size_high,
-            size_low,
+            self.file_size,
             c_file_name_len,
         )
         entry = header + fn_field
@@ -237,12 +233,10 @@ class Entry552:
             cr_time,
             acc_time,
             wr_time,
-            size_high,
-            size_low,
+            file_size,
             name_len,
-        ) = struct.unpack_from("<IQQQIII", data, 0)
+        ) = struct.unpack_from("<IQQQQI", data, 0)
 
-        file_size = (size_high << 32) | size_low
         raw_name = data[40 : 40 + min(name_len, 512)]
         fn = raw_name.decode("utf-16le", errors="replace").rstrip("\x00")
 
