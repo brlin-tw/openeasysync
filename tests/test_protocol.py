@@ -18,9 +18,8 @@ from openeasysync.constants import (
     OP_QUERY_SPACE,
     OP_RENAME_DIR,
     OP_RENAME_FILE,
-    OP_SET_MAC_MODE,
-    OP_UPLOAD_BATCH,
     OP_UPLOAD_SINGLE,
+    OP_VERIFY_PEER_NAME,
     OP_VNIC_SWITCH,
     OP_XML_CONTROL,
     REPLY_DOWNLOAD_BATCH_DONE,
@@ -37,7 +36,6 @@ from openeasysync.constants import (
 )
 from openeasysync.protocol.commands import (
     BatchPrecheckExtRecord,
-    BatchUploadRecord,
     decode_command,
     encode_cancel_transfer,
     encode_create_dir,
@@ -55,9 +53,8 @@ from openeasysync.protocol.commands import (
     encode_query_space,
     encode_rename_dir,
     encode_rename_file,
-    encode_set_mac_mode,
-    encode_upload_batch,
     encode_upload_single,
+    encode_verify_peer_name,
     encode_xml_control,
 )
 from openeasysync.protocol.directory_entry import Win32FindData, make_file_entry
@@ -102,62 +99,58 @@ def test_command_encoders_and_decoders():
     # Test backwards-compatible 1-byte decode
     assert decode_command(bytes([OP_QUERY_ROOT]))["opcode"] == OP_QUERY_ROOT
 
-    # 0x02 List Dir
-    c02 = decode_command(encode_list_dir("C:\\Users\\Guest"))
-    assert c02["opcode"] == OP_LIST_DIR
-    assert c02["path"] == "C:\\Users\\Guest"
+    # 0x02 Verify Peer Name
+    c02 = decode_command(encode_verify_peer_name("MYCOMPUTER"))
+    assert c02["opcode"] == OP_VERIFY_PEER_NAME
+    assert c02["computer_name"] == "MYCOMPUTER"
 
-    # 0x03 Delete File
-    c03 = decode_command(encode_delete_file("C:\\file.txt"))
-    assert c03["opcode"] == OP_DELETE_FILE
-    assert c03["path"] == "C:\\file.txt"
+    # 0x04 List Dir
+    c04 = decode_command(encode_list_dir("C:\\Users\\Guest"))
+    assert c04["opcode"] == OP_LIST_DIR
+    assert c04["path"] == "C:\\Users\\Guest"
 
-    # 0x04 Delete Dir
-    c04 = decode_command(encode_delete_dir("C:\\Folder"))
-    assert c04["opcode"] == OP_DELETE_DIR
-    assert c04["path"] == "C:\\Folder"
+    # 0x08 Delete File
+    c08 = decode_command(encode_delete_file("C:\\file.txt"))
+    assert c08["opcode"] == OP_DELETE_FILE
+    assert c08["path"] == "C:\\file.txt"
 
-    # 0x06 Create Dir
-    c06 = decode_command(encode_create_dir("C:\\NewFolder"))
-    assert c06["opcode"] == OP_CREATE_DIR
-    assert c06["path"] == "C:\\NewFolder"
+    # 0x06 Delete Dir (Remove Directory)
+    c06 = decode_command(encode_delete_dir("C:\\Folder"))
+    assert c06["opcode"] == OP_DELETE_DIR
+    assert c06["path"] == "C:\\Folder"
 
-    # 0x07 Rename File
-    c07 = decode_command(encode_rename_file("old.txt", "new.txt"))
-    assert c07["opcode"] == OP_RENAME_FILE
-    assert c07["old_path"] == "old.txt"
-    assert c07["new_path"] == "new.txt"
+    # 0x07 Create Dir
+    c07 = decode_command(encode_create_dir("C:\\NewFolder"))
+    assert c07["opcode"] == OP_CREATE_DIR
+    assert c07["path"] == "C:\\NewFolder"
 
-    # 0x08 Rename Dir
-    c08 = decode_command(encode_rename_dir("old_dir", "new_dir"))
-    assert c08["opcode"] == OP_RENAME_DIR
+    # 0x09 Rename File
+    c09 = decode_command(encode_rename_file("old.txt", "new.txt"))
+    assert c09["opcode"] == OP_RENAME_FILE
+    assert c09["old_path"] == "old.txt"
+    assert c09["new_path"] == "new.txt"
 
-    # 0x09 Upload Single
+    # 0x09 Rename Dir
+    c09b = decode_command(encode_rename_dir("old_dir", "new_dir"))
+    assert c09b["opcode"] == OP_RENAME_DIR
+
+    # 0x0A Upload Single
     fd = Win32FindData(filename="doc.txt", file_size=12)
-    c09 = decode_command(encode_upload_single("C:\\doc.txt", fd, b"Hello World!"))
-    assert c09["opcode"] == OP_UPLOAD_SINGLE
-    assert c09["dest_path"] == "C:\\doc.txt"
-    assert c09["file_data"] == b"Hello World!"
-    assert c09["find_data"].filename == "doc.txt"
+    c0a = decode_command(encode_upload_single("C:\\doc.txt", fd, b"Hello World!"))
+    assert c0a["opcode"] == OP_UPLOAD_SINGLE
+    assert c0a["dest_path"] == "C:\\doc.txt"
+    assert c0a["file_data"] == b"Hello World!"
+    assert c0a["find_data"].filename == "doc.txt"
 
-    # 0x0A Download Single
-    c0a = decode_command(encode_download_single("C:\\doc.txt"))
-    assert c0a["opcode"] == OP_DOWNLOAD_SINGLE
-    assert c0a["path"] == "C:\\doc.txt"
+    # 0x0B Download Single
+    c0b = decode_command(encode_download_single("C:\\doc.txt"))
+    assert c0b["opcode"] == OP_DOWNLOAD_SINGLE
+    assert c0b["path"] == "C:\\doc.txt"
 
-    # 0x0B Batch Upload
-    rec = BatchUploadRecord(rel_path="sub\\file.bin", find_data=fd, data=b"BIN_DATA")
-    c0b = decode_command(encode_upload_batch("C:\\Base", [rec]))
-    assert c0b["opcode"] == OP_UPLOAD_BATCH
-    assert c0b["base_dir"] == "C:\\Base"
-    assert len(c0b["records"]) == 1
-    assert c0b["records"][0].rel_path == "sub\\file.bin"
-    assert c0b["records"][0].data == b"BIN_DATA"
-
-    # 0x0C Batch Download
-    c0c = decode_command(encode_download_batch(["C:\\p1", "C:\\p2"]))
-    assert c0c["opcode"] == OP_DOWNLOAD_BATCH
-    assert c0c["paths"] == ["C:\\p1", "C:\\p2"]
+    # 0x10 Batch Download
+    c10 = decode_command(encode_download_batch(["C:\\p1", "C:\\p2"]))
+    assert c10["opcode"] == OP_DOWNLOAD_BATCH
+    assert c10["paths"] == ["C:\\p1", "C:\\p2"]
 
     # 0x0D Cancel Transfer
     c0d = decode_command(encode_cancel_transfer())
@@ -171,27 +164,23 @@ def test_command_encoders_and_decoders():
     c0f = decode_command(encode_precheck_single("C:\\file.txt"))
     assert c0f["opcode"] == OP_PRECHECK_SINGLE
 
-    # 0x10 Mac Mode
-    c10 = decode_command(encode_set_mac_mode())
-    assert c10["opcode"] == OP_SET_MAC_MODE
+    # 0x13 Batch Precheck
+    c13 = decode_command(encode_precheck_batch("C:\\Base", ["f1.txt", "f2.txt"]))
+    assert c13["opcode"] == OP_PRECHECK_BATCH
+    assert c13["dest_dir"] == "C:\\Base"
+    assert c13["rel_paths"] == ["f1.txt", "f2.txt"]
 
-    # 0x14 Batch Precheck
-    c14 = decode_command(encode_precheck_batch("C:\\Base", ["f1.txt", "f2.txt"]))
-    assert c14["opcode"] == OP_PRECHECK_BATCH
-    assert c14["dest_dir"] == "C:\\Base"
-    assert c14["rel_paths"] == ["f1.txt", "f2.txt"]
-
-    # 0x15 Batch Precheck Ext
-    c15 = decode_command(
+    # 0x16 Batch Precheck Ext
+    c16 = decode_command(
         encode_precheck_batch_ext("C:\\Base", [BatchPrecheckExtRecord("f1.txt", fd)])
     )
-    assert c15["opcode"] == OP_PRECHECK_BATCH_EXT
-    assert len(c15["records"]) == 1
+    assert c16["opcode"] == OP_PRECHECK_BATCH_EXT
+    assert len(c16["records"]) == 1
 
-    # 0x16 XML Control
-    c16 = decode_command(encode_xml_control("<OTIMSG></OTIMSG>"))
-    assert c16["opcode"] == OP_XML_CONTROL
-    assert c16["xml"] == "<OTIMSG></OTIMSG>"
+    # 0x34 XML Control (<OTIMSG>)
+    c34 = decode_command(encode_xml_control("<OTIMSG></OTIMSG>"))
+    assert c34["opcode"] == OP_XML_CONTROL
+    assert c34["xml"] == "<OTIMSG></OTIMSG>"
 
     # 0x17 Query Errors
     c17 = decode_command(encode_query_errors([5, 112]))

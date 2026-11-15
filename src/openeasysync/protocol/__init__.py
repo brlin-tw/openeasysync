@@ -23,8 +23,8 @@ from openeasysync.protocol.commands import (
     encode_rename_dir,
     encode_rename_file,
     encode_set_mac_mode,
-    encode_upload_batch,
     encode_upload_single,
+    encode_verify_peer_name,
     encode_xml_control,
 )
 from openeasysync.protocol.directory_entry import (
@@ -78,7 +78,7 @@ __all__ = [
     "encode_upload_single",
     "encode_download_single",
     "encode_extended_xml",
-    "encode_upload_batch",
+    "encode_verify_peer_name",
     "encode_download_batch",
     "encode_cancel_transfer",
     "encode_query_space",

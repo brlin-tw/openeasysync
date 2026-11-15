@@ -27,8 +27,8 @@ from openeasysync.constants import (
     OP_RENAME_DIR,
     OP_RENAME_FILE,
     OP_SET_MAC_MODE,
-    OP_UPLOAD_BATCH,
     OP_UPLOAD_SINGLE,
+    OP_VERIFY_PEER_NAME,
     OP_VNIC_SWITCH,
     OP_XML_CONTROL,
     STATUS_EXISTS,
@@ -83,6 +83,9 @@ class PeerServerHandler:
         if opcode == OP_QUERY_ROOT:
             return [self._handle_query_root()]
 
+        if opcode == OP_VERIFY_PEER_NAME:
+            return [encode_status_ack(STATUS_OK)]
+
         if opcode == OP_LIST_DIR:
             return [self._handle_list_dir(cmd["path"])]
 
@@ -105,9 +108,6 @@ class PeerServerHandler:
 
         if opcode == OP_DOWNLOAD_SINGLE:
             return [self._handle_download_single(cmd["path"])]
-
-        if opcode == OP_UPLOAD_BATCH:
-            return [self._handle_upload_batch(cmd["base_dir"], cmd["records"])]
 
         if opcode == OP_DOWNLOAD_BATCH:
             return self._handle_download_batch(cmd["paths"])
@@ -493,7 +493,10 @@ class PeerServerHandler:
 
     def _handle_extended_xml(self, opcode: int, xml_content: str) -> bytes:
         """Handles incoming 0x32..0x39 Extended XML commands from peer."""
-        if opcode == OP_VNIC_SWITCH and "PleaseSwitchAsVirtualNIC" in xml_content:
+        if opcode in (0x32, 0x33) and not xml_content:
+            return encode_status_ack(STATUS_OK)
+
+        if opcode in (OP_VNIC_SWITCH, 0x32) and "PleaseSwitchAsVirtualNIC" in xml_content:
             return encode_extended_xml(
                 opcode, "<ExtraXmlCommand>RejectSwitchAsVirtualNIC</ExtraXmlCommand>"
             )

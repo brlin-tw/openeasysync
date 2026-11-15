@@ -1,6 +1,6 @@
 # Copyright 2026 林博仁(Buo-ren Lin) <buo.ren.lin@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Encoders and decoders for all Client Commands (0x01..0x17)."""
+"""Encoders and decoders for all Client Commands (0x01..0x39)."""
 
 import struct
 from dataclasses import dataclass
@@ -15,19 +15,22 @@ from openeasysync.constants import (
     OP_DOWNLOAD_SINGLE,
     OP_EXTENDED_XML_MAX,
     OP_EXTENDED_XML_MIN,
+    OP_EXTRA_XML,
     OP_LIST_DIR,
+    OP_PLUGIN_RPC,
     OP_PRECHECK_BATCH,
     OP_PRECHECK_BATCH_EXT,
     OP_PRECHECK_SINGLE,
     OP_QUERY_ERRORS,
     OP_QUERY_ROOT,
     OP_QUERY_SPACE,
+    OP_REMOVE_DIR,
+    OP_RENAME,
     OP_RENAME_DIR,
     OP_RENAME_FILE,
     OP_SET_MAC_MODE,
-    OP_UPLOAD_BATCH,
     OP_UPLOAD_SINGLE,
-    OP_XML_CONTROL,
+    OP_VERIFY_PEER_NAME,
     WIN32_FIND_DATA_SIZE,
 )
 from openeasysync.protocol.directory_entry import Win32FindData
@@ -61,42 +64,52 @@ def encode_query_root(path: str = "\\") -> bytes:
     return bytes([OP_QUERY_ROOT, 0x00, 0x00, 0x00, len(path_bytes)]) + path_bytes
 
 
+def encode_verify_peer_name(computer_name: str, encoding: str = "ascii") -> bytes:
+    """Opcode 0x02: Verify Peer Computer Name."""
+    name_b = computer_name.encode(encoding, errors="replace")
+    return bytes([OP_VERIFY_PEER_NAME, len(name_b)]) + name_b
+
+
 def encode_list_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x02: List Directory."""
+    """Opcode 0x04: Change / List Remote Directory.
+
+    EasySuite.exe wire format (0x0040db44 / 0x0043d741):
+    [0x04][path_len:u16_le][dir_path:bytes]
+    """
     path_bytes = dir_path.encode(encoding, errors="replace")
-    return bytes([OP_LIST_DIR]) + struct.pack("<I", len(path_bytes)) + path_bytes
+    return bytes([OP_LIST_DIR]) + struct.pack("<H", len(path_bytes)) + path_bytes
 
 
 def encode_delete_file(file_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x03: Delete File."""
+    """Opcode 0x08: Delete Remote File."""
     path_bytes = file_path.encode(encoding, errors="replace")
     return bytes([OP_DELETE_FILE]) + struct.pack("<I", len(path_bytes)) + path_bytes
 
 
 def encode_delete_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x04: Delete Directory (Recursive)."""
+    """Opcode 0x06: Remove Remote Directory."""
     path_bytes = dir_path.encode(encoding, errors="replace")
-    return bytes([OP_DELETE_DIR]) + struct.pack("<I", len(path_bytes)) + path_bytes
+    return bytes([OP_REMOVE_DIR]) + struct.pack("<I", len(path_bytes)) + path_bytes
 
 
 def encode_create_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x06: Create Directory."""
+    """Opcode 0x07: Create Remote Directory."""
     path_bytes = dir_path.encode(encoding, errors="replace")
     return bytes([OP_CREATE_DIR]) + struct.pack("<I", len(path_bytes)) + path_bytes
 
 
 def encode_rename_file(old_path: str, new_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x07: Rename File."""
+    """Opcode 0x09: Rename Remote File."""
     old_b = old_path.encode(encoding, errors="replace")
     new_b = new_path.encode(encoding, errors="replace")
-    return bytes([OP_RENAME_FILE]) + struct.pack("<II", len(old_b), len(new_b)) + old_b + new_b
+    return bytes([OP_RENAME]) + struct.pack("<II", len(old_b), len(new_b)) + old_b + new_b
 
 
 def encode_rename_dir(old_path: str, new_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x08: Rename Directory."""
+    """Opcode 0x09: Rename Remote Directory."""
     old_b = old_path.encode(encoding, errors="replace")
     new_b = new_path.encode(encoding, errors="replace")
-    return bytes([OP_RENAME_DIR]) + struct.pack("<II", len(old_b), len(new_b)) + old_b + new_b
+    return bytes([OP_RENAME]) + struct.pack("<II", len(old_b), len(new_b)) + old_b + new_b
 
 
 def encode_upload_single(
@@ -105,7 +118,7 @@ def encode_upload_single(
     file_data: bytes,
     encoding: str = "utf-8",
 ) -> bytes:
-    """Opcode 0x09: Upload Single File to Peer."""
+    """Opcode 0x0A: Single File Upload Request."""
     path_b = dest_path.encode(encoding, errors="replace")
     fd_b = find_data.pack(encoding=encoding)
     header = bytes([OP_UPLOAD_SINGLE]) + struct.pack("<II", len(path_b), len(file_data)) + fd_b
@@ -113,32 +126,15 @@ def encode_upload_single(
 
 
 def encode_download_single(src_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x0A: Download Single File from Peer."""
+    """Opcode 0x0B: Single File Download Request."""
     path_b = src_path.encode(encoding, errors="replace")
     return bytes([OP_DOWNLOAD_SINGLE]) + struct.pack("<I", len(path_b)) + path_b
 
 
-def encode_upload_batch(
-    base_dir: str,
-    records: list[BatchUploadRecord],
-    encoding: str = "utf-8",
-) -> bytes:
-    """Opcode 0x0B: Batch Upload Files/Directories to Peer."""
-    base_b = base_dir.encode(encoding, errors="replace")
-    header = bytes([OP_UPLOAD_BATCH]) + struct.pack("<II", len(base_b), len(records)) + base_b
-    body = bytearray(header)
-    for rec in records:
-        rel_b = rec.rel_path.encode(encoding, errors="replace")
-        fd_b = rec.find_data.pack(encoding=encoding)
-        rec_hdr = struct.pack("<II", len(rel_b), len(rec.data)) + fd_b + rel_b + rec.data
-        body.extend(rec_hdr)
-    return bytes(body)
-
-
 def encode_download_batch(paths: list[str], encoding: str = "utf-8") -> bytes:
-    """Opcode 0x0C: Batch Download Files/Directories from Peer."""
+    """Opcode 0x10: Batch Download Files/Directories from Peer."""
     body = bytearray([OP_DOWNLOAD_BATCH])
-    body.extend(struct.pack("<I", len(paths)))
+    body.extend(struct.pack("<H", len(paths)))
     for p in paths:
         pb = p.encode(encoding, errors="replace")
         body.extend(struct.pack("<I", len(pb)))
@@ -164,12 +160,12 @@ def encode_precheck_single(dest_path: str, encoding: str = "utf-8") -> bytes:
 
 
 def encode_set_mac_mode() -> bytes:
-    """Opcode 0x10: Set Peer Platform = Mac."""
+    """Opcode 0x10: Set Peer Platform = Mac (legacy)."""
     return bytes([OP_SET_MAC_MODE])
 
 
 def encode_precheck_batch(dest_dir: str, rel_paths: list[str], encoding: str = "utf-8") -> bytes:
-    """Opcode 0x14: Batch Upload Pre-Check."""
+    """Opcode 0x13: Batch Upload Pre-Check."""
     dir_b = dest_dir.encode(encoding, errors="replace")
     body = bytearray([OP_PRECHECK_BATCH])
     body.extend(struct.pack("<II", len(dir_b), len(rel_paths)))
@@ -186,7 +182,7 @@ def encode_precheck_batch_ext(
     records: list[BatchPrecheckExtRecord],
     encoding: str = "utf-8",
 ) -> bytes:
-    """Opcode 0x15: Extended Batch Pre-Check with Metadata."""
+    """Opcode 0x16: Extended Batch Pre-Check with Metadata."""
     dir_b = dest_dir.encode(encoding, errors="replace")
     body = bytearray([OP_PRECHECK_BATCH_EXT])
     body.extend(struct.pack("<II", len(dir_b), len(records)))
@@ -200,10 +196,13 @@ def encode_precheck_batch_ext(
     return bytes(body)
 
 
-def encode_xml_control(xml_content: str, encoding: str = "ascii") -> bytes:
-    """Opcode 0x16: <OTIMSG> XML Control Message."""
+def encode_xml_control(
+    xml_content: str, dll_name: str = "ECN001.DLL", encoding: str = "ascii"
+) -> bytes:
+    """Opcode 0x34: <OTIMSG> Dynamic Library Plugin RPC XML Tunnel."""
+    dll_b = dll_name.encode("ascii", errors="replace")
     xml_b = xml_content.encode(encoding, errors="replace")
-    return bytes([OP_XML_CONTROL]) + struct.pack("<I", len(xml_b)) + xml_b
+    return bytes([OP_PLUGIN_RPC, len(dll_b)]) + dll_b + struct.pack("<I", len(xml_b)) + xml_b
 
 
 def encode_query_errors(error_codes: list[int]) -> bytes:
@@ -218,6 +217,8 @@ def encode_query_errors(error_codes: list[int]) -> bytes:
 def encode_extended_xml(opcode: int, xml_content: str) -> bytes:
     """Opcode 0x32..0x39: Extended XML Command."""
     xml_b = xml_content.encode("ascii", errors="replace")
+    if opcode == OP_EXTRA_XML:
+        return bytes([opcode]) + struct.pack("<I", len(xml_b)) + xml_b
     if not xml_b.endswith(b"\x00"):
         xml_b += b"\x00"
     return bytes([opcode]) + xml_b
@@ -240,9 +241,19 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             path = payload[5 : 5 + path_len].decode(encoding, errors="replace")
         return {"opcode": OP_QUERY_ROOT, "path": path}
 
+    if opcode == OP_VERIFY_PEER_NAME:
+        name_len = payload[1] if len(payload) > 1 else 0
+        name = payload[2 : 2 + name_len].decode(encoding, errors="replace")
+        return {"opcode": opcode, "computer_name": name}
+
+    if opcode == OP_LIST_DIR:
+        path_len = struct.unpack_from("<H", payload, 1)[0]
+        path_str = payload[3 : 3 + path_len].decode(encoding, errors="replace")
+        return {"opcode": opcode, "path": path_str}
+
     if opcode in (
-        OP_LIST_DIR,
         OP_DELETE_FILE,
+        OP_REMOVE_DIR,
         OP_DELETE_DIR,
         OP_CREATE_DIR,
         OP_DOWNLOAD_SINGLE,
@@ -253,7 +264,7 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
         return {"opcode": opcode, "path": path_str}
 
-    if opcode in (OP_RENAME_FILE, OP_RENAME_DIR):
+    if opcode in (OP_RENAME, OP_RENAME_FILE, OP_RENAME_DIR):
         old_len, new_len = struct.unpack_from("<II", payload, 1)
         old_path = payload[9 : 9 + old_len].decode(encoding, errors="replace")
         new_path = payload[9 + old_len : 9 + old_len + new_len].decode(encoding, errors="replace")
@@ -272,27 +283,12 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             "file_data": file_data,
         }
 
-    if opcode == OP_UPLOAD_BATCH:
-        base_len, count = struct.unpack_from("<II", payload, 1)
-        base_dir = payload[9 : 9 + base_len].decode(encoding, errors="replace")
-        records: list[BatchUploadRecord] = []
-        offset = 9 + base_len
-        for _ in range(count):
-            rel_len, d_len = struct.unpack_from("<II", payload, offset)
-            fd = Win32FindData.unpack(
-                payload[offset + 8 : offset + 8 + WIN32_FIND_DATA_SIZE], encoding=encoding
-            )
-            rel_start = offset + 8 + WIN32_FIND_DATA_SIZE
-            rel_path = payload[rel_start : rel_start + rel_len].decode(encoding, errors="replace")
-            rec_data = payload[rel_start + rel_len : rel_start + rel_len + d_len]
-            records.append(BatchUploadRecord(rel_path=rel_path, find_data=fd, data=rec_data))
-            offset = rel_start + rel_len + d_len
-        return {"opcode": OP_UPLOAD_BATCH, "base_dir": base_dir, "records": records}
-
     if opcode == OP_DOWNLOAD_BATCH:
-        count = struct.unpack_from("<I", payload, 1)[0]
+        if len(payload) < 3:
+            return {"opcode": OP_DOWNLOAD_BATCH, "paths": []}
+        count = struct.unpack_from("<H", payload, 1)[0]
         paths: list[str] = []
-        offset = 5
+        offset = 3
         for _ in range(count):
             p_len = struct.unpack_from("<I", payload, offset)[0]
             p_str = payload[offset + 4 : offset + 4 + p_len].decode(encoding, errors="replace")
@@ -334,10 +330,16 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             offset = r_start + r_len
         return {"opcode": OP_PRECHECK_BATCH_EXT, "dest_dir": dest_dir, "records": ext_records}
 
-    if opcode == OP_XML_CONTROL:
-        xml_len = struct.unpack_from("<I", payload, 1)[0]
-        xml_str = payload[5 : 5 + xml_len].decode("ascii", errors="replace")
-        return {"opcode": OP_XML_CONTROL, "xml": xml_str}
+    if opcode == OP_PLUGIN_RPC:
+        if len(payload) >= 2:
+            dll_len = payload[1]
+            dll_name = payload[2 : 2 + dll_len].decode("ascii", errors="replace")
+            if len(payload) >= 2 + dll_len + 4:
+                xml_len = struct.unpack_from("<I", payload, 2 + dll_len)[0]
+                xml_start = 2 + dll_len + 4
+                xml_str = payload[xml_start : xml_start + xml_len].decode("ascii", errors="replace")
+                return {"opcode": opcode, "dll_name": dll_name, "xml": xml_str}
+        return {"opcode": opcode, "raw": payload}
 
     if opcode == OP_QUERY_ERRORS:
         count = struct.unpack_from("<I", payload, 1)[0]
@@ -345,7 +347,11 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         return {"opcode": OP_QUERY_ERRORS, "error_codes": codes}
 
     if OP_EXTENDED_XML_MIN <= opcode <= OP_EXTENDED_XML_MAX:
-        xml_str = payload[1:].decode("ascii", errors="replace").rstrip("\x00")
+        if opcode == OP_EXTRA_XML and len(payload) >= 5:
+            xml_len = struct.unpack_from("<I", payload, 1)[0]
+            xml_str = payload[5 : 5 + xml_len].decode("ascii", errors="replace")
+        else:
+            xml_str = payload[1:].decode("ascii", errors="replace").rstrip("\x00")
         return {"opcode": opcode, "xml": xml_str}
 
     return {"opcode": opcode, "raw": payload}

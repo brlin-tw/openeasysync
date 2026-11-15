@@ -19,7 +19,6 @@ from openeasysync.constants import (
     REPLY_STATUS_ACK,
     STATUS_EXISTS,
     STATUS_OK,
-    STATUS_UPLOAD_BATCH_DONE,
     STATUS_UPLOAD_SINGLE_DONE,
 )
 from openeasysync.protocol.commands import (
@@ -37,7 +36,6 @@ from openeasysync.protocol.commands import (
     encode_query_root,
     encode_rename_dir,
     encode_rename_file,
-    encode_upload_batch,
     encode_upload_single,
 )
 from openeasysync.protocol.directory_entry import (
@@ -285,13 +283,20 @@ class TransferManager:
                         filtered_records.append(r)
                 records = filtered_records
 
-        cmd = encode_upload_batch(remote_base_dir, records)
-        rep_bytes = self.session.send_command(cmd)
-        rep = decode_reply(rep_bytes)
-        return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] in (
-            STATUS_OK,
-            STATUS_UPLOAD_BATCH_DONE,
-        )
+        for rec in records:
+            remote_target = os.path.join(remote_base_dir, rec.rel_path).replace("/", "\\")
+            if rec.find_data.is_directory:
+                self.create_dir(remote_target)
+            else:
+                parent = os.path.dirname(remote_target)
+                if parent:
+                    self.create_dir(parent)
+                cmd = encode_upload_single(remote_target, rec.find_data, rec.data)
+                rep_bytes = self.session.send_command(cmd)
+                rep = decode_reply(rep_bytes)
+                if rep["opcode"] != REPLY_STATUS_ACK:
+                    return False
+        return True
 
     def download_batch(
         self,

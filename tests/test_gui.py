@@ -126,4 +126,3 @@ def test_main_window_up_button_focused_pane(qapp, tmp_path):
 
     win.close()
     win.deleteLater()
-
