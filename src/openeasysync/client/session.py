@@ -87,11 +87,11 @@ class SessionManager:
         self.transport.get_buffer_size()
         self.transport.get_usb_speed()
 
-        # 5. Flush Pipes
-        self.transport.flush_pipes()
-
-        # 6. Enter Transfer Line Mode (0x007F)
+        # 5. Enter Transfer Line Mode (0x007F)
         self.transport.set_mode(MODE_TRANSFER_LINE)
+
+        # 6. Flush Pipes (CDB 0xD8 0x01 cmd=8 and cmd=7 at 0x0041D014 / 0x0043258B)
+        self.transport.flush_pipes()
 
         # 7. Start Poller and Dispatcher
         self._running = True
