@@ -86,3 +86,44 @@ def test_main_window_with_mock_session(qapp, tmp_path):
     win.refresh_remote()
     win.close()
     win.deleteLater()
+
+
+def test_main_window_up_button_focused_pane(qapp, tmp_path):
+    """Verify MainWindow Up action moves only the currently focused pane."""
+    win = MainWindow()
+    win.show()
+
+    # Create dummy local path structure
+    sub_dir = tmp_path / "sub1" / "sub2"
+    sub_dir.mkdir(parents=True)
+    win.local_current_path = str(sub_dir)
+    win.remote_current_path = "C:\\Windows\\System32"
+
+    # 1. Focus local pane table: Up should only navigate local pane
+    win.local_pane.table.setFocus()
+    qapp.processEvents()
+    assert win._get_focused_pane() is win.local_pane
+
+    win.act_up.trigger()
+    assert win.local_current_path == str(sub_dir.parent)
+    assert win.remote_current_path == "C:\\Windows\\System32"
+
+    # 2. Focus remote pane table: Up should only navigate remote pane
+    win.remote_pane.table.setFocus()
+    qapp.processEvents()
+    assert win._get_focused_pane() is win.remote_pane
+
+    win.act_up.trigger()
+    assert win.local_current_path == str(sub_dir.parent)
+    assert win.remote_current_path == "C:\\Windows"
+
+    # Continue remote navigation up to drive root and then roots view
+    win.act_up.trigger()
+    assert win.remote_current_path == "C:\\"
+
+    win.act_up.trigger()
+    assert win.remote_current_path == ""
+
+    win.close()
+    win.deleteLater()
+

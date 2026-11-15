@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Main window for OpenEasySync dual-pane host-to-host file manager."""
 
+import ntpath
 import os
+import posixpath
 import time
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QFocusEvent, QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -62,6 +65,7 @@ class FilePane(QWidget):
     """Single filesystem pane (Folder / File Table)."""
 
     navigate_requested = Signal(str)
+    focused = Signal()
 
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
@@ -91,7 +95,22 @@ class FilePane(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        self.table.installEventFilter(self)
         layout.addWidget(self.table)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.table and event.type() == QEvent.FocusIn:
+            self.focused.emit()
+        return super().eventFilter(watched, event)
+
+    def focusInEvent(self, event: QFocusEvent) -> None:
+        self.focused.emit()
+        super().focusInEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        self.table.setFocus()
+        self.focused.emit()
+        super().mousePressEvent(event)
 
     def set_entries(self, path: str, entries: list[Entry552]) -> None:
         self.current_path = path
@@ -174,6 +193,9 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         self.local_pane = FilePane("Local Host (My Computer)")
         self.remote_pane = FilePane("Remote Host (Remote Computer)")
+        self._focused_pane = self.local_pane
+        self.local_pane.focused.connect(lambda: self._set_focused_pane(self.local_pane))
+        self.remote_pane.focused.connect(lambda: self._set_focused_pane(self.remote_pane))
         self.local_pane.navigate_requested.connect(self._on_local_navigate)
         self.remote_pane.navigate_requested.connect(self._on_remote_navigate)
 
@@ -328,19 +350,41 @@ class MainWindow(QMainWindow):
         self.remote_current_path = new_path
         self.refresh_remote()
 
-    def _on_up_clicked(self) -> None:
-        # Check which pane has focus or navigate both
-        parent_loc = os.path.dirname(self.local_current_path)
-        if parent_loc and parent_loc != self.local_current_path:
-            self.local_current_path = parent_loc
-            self.refresh_local()
+    def _set_focused_pane(self, pane: FilePane) -> None:
+        self._focused_pane = pane
 
-        if self.remote_current_path:
-            # Strip last segment
-            clean_r = self.remote_current_path.rstrip("\\/")
-            parent_r = os.path.dirname(clean_r)
-            self.remote_current_path = parent_r
-            self.refresh_remote()
+    def _get_focused_pane(self) -> FilePane:
+        fw = QApplication.focusWidget()
+        if fw is not None:
+            if fw is self.remote_pane or self.remote_pane.isAncestorOf(fw):
+                self._focused_pane = self.remote_pane
+                return self.remote_pane
+            if fw is self.local_pane or self.local_pane.isAncestorOf(fw):
+                self._focused_pane = self.local_pane
+                return self.local_pane
+        return getattr(self, "_focused_pane", self.local_pane)
+
+    def _on_up_clicked(self) -> None:
+        focused = self._get_focused_pane()
+        if focused is self.local_pane:
+            parent_loc = os.path.dirname(self.local_current_path)
+            if parent_loc and parent_loc != self.local_current_path:
+                self.local_current_path = parent_loc
+                self.refresh_local()
+        elif focused is self.remote_pane:
+            if self.remote_current_path:
+                clean_r = self.remote_current_path.rstrip("\\/")
+                if not clean_r or (len(clean_r) == 2 and clean_r[1] == ":"):
+                    self.remote_current_path = ""
+                elif "\\" in clean_r or ":" in clean_r:
+                    parent_r = ntpath.dirname(clean_r)
+                    if len(parent_r) == 2 and parent_r[1] == ":":
+                        parent_r += "\\"
+                    self.remote_current_path = parent_r
+                else:
+                    parent_r = posixpath.dirname(clean_r)
+                    self.remote_current_path = "" if parent_r == clean_r else parent_r
+                self.refresh_remote()
 
     def _on_refresh_clicked(self) -> None:
         self.refresh_local()
