@@ -18,6 +18,7 @@ from openeasysync.constants import (
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
     STATUS_ACTIVE_DIR_ACK,
+    STATUS_ERROR,
     STATUS_EXISTS,
     STATUS_OK,
     STATUS_UPLOAD_SINGLE_DONE,
@@ -88,15 +89,22 @@ class TransferManager:
         cmd = encode_notify_active_dir(remote_path)
         rep_bytes = self.session.send_command(cmd)
         rep = decode_reply(rep_bytes)
-        return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_ACTIVE_DIR_ACK
+        return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] in (
+            STATUS_OK,
+            STATUS_ACTIVE_DIR_ACK,
+        )
 
     def list_dir(self, remote_path: str) -> list[Entry552]:
         """Lists directory contents on remote peer (Opcode 0x04)."""
         cmd = encode_list_dir(remote_path)
-        rep_bytes = self.session.send_command(cmd)
+        rep_bytes = self.session.send_command(cmd, expected_opcodes=(REPLY_LISTING,))
         rep = decode_reply(rep_bytes)
         if rep["opcode"] == REPLY_LISTING:
             return rep["entries"]
+        if rep["opcode"] == REPLY_STATUS_ACK and rep.get("status") == STATUS_ERROR:
+            raise OSError(
+                f"Remote error listing '{remote_path}': Win32 error {rep.get('win32_error')}"
+            )
         if rep["opcode"] == REPLY_ERROR_CODE:
             raise OSError(f"Remote error listing '{remote_path}': Win32 error {rep['win32_error']}")
         return []

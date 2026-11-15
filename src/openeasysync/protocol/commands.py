@@ -53,16 +53,25 @@ class BatchPrecheckExtRecord:
 # Encoders
 
 
-def encode_query_root(path: str = "\\") -> bytes:
+def encode_query_root(
+    computer_name: str = "TXLIN1",
+    flags: int = 0x07,
+    code_page: int = 1252,
+    path: str | None = None,
+) -> bytes:
     """Opcode 0x01: Query Peer Root / Drives.
 
-    EasySuite.exe wire format (0x0040d9f8 / 0x0043d479):
-    [0x01][flags:u8][param:u16_le][path_len:u8][path:bytes]
-    Note: EasySuite.exe requires a non-empty path (default: '\\') to pass its
-    sanity check at 0x00440fe9; otherwise it aborts without sending root drives.
+    EasySuite.exe wire format (Section 4.2.1):
+    [0x01][flags:u8][code_page:u16_le][name_len:u8][computer_name:bytes]
+    (11 bytes total for default host query)
     """
-    path_bytes = path.encode("ascii", errors="replace")
-    return bytes([OP_QUERY_ROOT, 0x00, 0x00, 0x00, len(path_bytes)]) + path_bytes
+    name = path if path and computer_name == "TXLIN1" else computer_name
+    name_bytes = name.encode("ascii", errors="replace")[:255]
+    return (
+        bytes([OP_QUERY_ROOT, flags & 0xFF])
+        + struct.pack("<HB", code_page & 0xFFFF, len(name_bytes))
+        + name_bytes
+    )
 
 
 def encode_notify_active_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
@@ -82,11 +91,11 @@ def encode_verify_peer_name(computer_name: str, encoding: str = "ascii") -> byte
     return encode_notify_active_dir(computer_name, encoding=encoding)
 
 
-def encode_list_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
+def encode_list_dir(dir_path: str, encoding: str = "utf-16le") -> bytes:
     """Opcode 0x04: Change / List Remote Directory.
 
     EasySuite.exe wire format (0x0040db44 / 0x0043d741):
-    [0x04][path_len:u16_le][dir_path:bytes]
+    [0x04][path_len:u16_le][dir_path:wchar_t]
     """
     path_bytes = dir_path.encode(encoding, errors="replace")
     return bytes([OP_LIST_DIR]) + struct.pack("<H", len(path_bytes)) + path_bytes
@@ -247,11 +256,22 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
     opcode = payload[0]
 
     if opcode == OP_QUERY_ROOT:
+        flags = 0
+        code_page = 0
+        comp_name = ""
         path = ""
         if len(payload) >= 5:
-            path_len = payload[4]
-            path = payload[5 : 5 + path_len].decode(encoding, errors="replace")
-        return {"opcode": OP_QUERY_ROOT, "path": path}
+            flags = payload[1]
+            code_page, name_len = struct.unpack_from("<HB", payload, 2)
+            comp_name = payload[5 : 5 + name_len].decode("ascii", errors="replace")
+            path = comp_name or "\\"
+        return {
+            "opcode": OP_QUERY_ROOT,
+            "flags": flags,
+            "code_page": code_page,
+            "computer_name": comp_name,
+            "path": path,
+        }
 
     if opcode in (OP_NOTIFY_ACTIVE_DIR, OP_VERIFY_PEER_NAME):
         path_len = payload[1] if len(payload) > 1 else 0
@@ -260,7 +280,11 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
 
     if opcode == OP_LIST_DIR:
         path_len = struct.unpack_from("<H", payload, 1)[0]
-        path_str = payload[3 : 3 + path_len].decode(encoding, errors="replace")
+        raw_path = payload[3 : 3 + path_len]
+        try:
+            path_str = raw_path.decode("utf-16le")
+        except Exception:
+            path_str = raw_path.decode(encoding, errors="replace")
         return {"opcode": opcode, "path": path_str}
 
     if opcode in (

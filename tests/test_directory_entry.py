@@ -4,16 +4,12 @@
 
 from openeasysync.constants import (
     DIR_ENTRY_SIZE,
-    DRIVE_FIXED,
-    ENTRY_KIND_DRIVE,
-    ENTRY_KIND_FILE,
     FILE_ATTRIBUTE_DIRECTORY,
 )
 from openeasysync.protocol.directory_entry import (
     Entry552,
     Win32FindData,
     filetime_to_unix,
-    make_drive_entry,
     make_file_entry,
     unix_to_filetime,
 )
@@ -59,37 +55,26 @@ def test_win32_find_data_pack_unpack():
     assert unpacked.is_directory is True
 
 
-def test_entry552_file_and_drive_pack_unpack():
+def test_entry552_file_and_dir_pack_unpack():
     """Verify 552-byte Entry552 packs to exactly 552 bytes and deserializes correctly."""
-    # 1. File Entry
-    file_entry = make_file_entry("test_document.pdf", size=98765, is_dir=False)
+    # 1. File Entry with Unicode name
+    file_entry = make_file_entry("測試文件_test_doc.pdf", size=98765, is_dir=False)
     file_raw = file_entry.pack()
     assert len(file_raw) == DIR_ENTRY_SIZE
 
     unpacked_f = Entry552.unpack(file_raw)
-    assert unpacked_f.entry_kind == ENTRY_KIND_FILE
     assert unpacked_f.is_file is True
     assert unpacked_f.is_dir is False
-    assert unpacked_f.find_data.filename == "test_document.pdf"
+    assert unpacked_f.filename == "測試文件_test_doc.pdf"
+    assert unpacked_f.find_data.filename == "測試文件_test_doc.pdf"
     assert unpacked_f.find_data.file_size == 98765
 
-    # 2. Drive Entry
-    drive_entry = make_drive_entry(
-        name="C:\\",
-        drive_type=DRIVE_FIXED,
-        total_bytes=1000 * 1024 * 1024 * 1024,
-        free_bytes=500 * 1024 * 1024 * 1024,
-        label="System Volume",
-        fs_name="NTFS",
-    )
-    drive_raw = drive_entry.pack()
-    assert len(drive_raw) == DIR_ENTRY_SIZE
+    # 2. Directory Entry
+    dir_entry = make_file_entry("SubFolder", is_dir=True)
+    dir_raw = dir_entry.pack()
+    assert len(dir_raw) == DIR_ENTRY_SIZE
 
-    unpacked_d = Entry552.unpack(drive_raw)
-    assert unpacked_d.entry_kind == ENTRY_KIND_DRIVE
-    assert unpacked_d.is_drive is True
-    assert unpacked_d.find_data.filename == "C:\\"
-    assert unpacked_d.total_bytes == 1000 * 1024 * 1024 * 1024
-    assert unpacked_d.total_free_bytes == 500 * 1024 * 1024 * 1024
-    assert unpacked_d.volume_label == "System Volume"
-    assert unpacked_d.filesystem_name == "NTFS"
+    unpacked_d = Entry552.unpack(dir_raw)
+    assert unpacked_d.is_dir is True
+    assert unpacked_d.is_file is False
+    assert unpacked_d.filename == "SubFolder"

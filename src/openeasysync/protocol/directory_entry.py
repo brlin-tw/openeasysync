@@ -120,10 +120,16 @@ class Win32FindData:
 
 @dataclass
 class Entry552:
-    """Represents the 552-byte Directory/Drive entry layout."""
+    """Represents the fixed-size 552-byte (0x228) WIN32_FIND_DATAW directory entry layout."""
 
-    entry_kind: int = ENTRY_KIND_FILE  # 0 = Drive, 1 = File/Directory
-    find_data: Win32FindData = None  # type: ignore
+    filename: str = ""
+    file_attributes: int = FILE_ATTRIBUTE_NORMAL
+    creation_time: int = 0
+    last_access_time: int = 0
+    last_write_time: int = 0
+    file_size: int = 0
+    is_drive: bool = False
+    entry_kind: int = ENTRY_KIND_FILE
     drive_type: int = DRIVE_FIXED
     total_bytes: int = 0
     total_free_bytes: int = 0
@@ -131,74 +137,122 @@ class Entry552:
     volume_label: str = ""
     filesystem_name: str = ""
 
-    def __post_init__(self):
-        if self.find_data is None:
-            self.find_data = Win32FindData()
+    def __init__(
+        self,
+        filename: str = "",
+        file_attributes: int = FILE_ATTRIBUTE_NORMAL,
+        creation_time: int = 0,
+        last_access_time: int = 0,
+        last_write_time: int = 0,
+        file_size: int = 0,
+        is_drive: bool = False,
+        find_data: Win32FindData | None = None,
+        entry_kind: int = ENTRY_KIND_FILE,
+        drive_type: int = DRIVE_FIXED,
+        total_bytes: int = 0,
+        total_free_bytes: int = 0,
+        caller_free_bytes: int = 0,
+        volume_label: str = "",
+        filesystem_name: str = "",
+    ):
+        if find_data is not None:
+            self.filename = find_data.filename
+            self.file_attributes = find_data.file_attributes
+            self.creation_time = find_data.creation_time
+            self.last_access_time = find_data.last_access_time
+            self.last_write_time = find_data.last_write_time
+            self.file_size = find_data.file_size
+        else:
+            self.filename = filename
+            self.file_attributes = file_attributes
+            self.creation_time = creation_time
+            self.last_access_time = last_access_time
+            self.last_write_time = last_write_time
+            self.file_size = file_size
 
-    @property
-    def is_drive(self) -> bool:
-        return self.entry_kind == ENTRY_KIND_DRIVE
+        self.is_drive = is_drive or (entry_kind == ENTRY_KIND_DRIVE)
+        self.entry_kind = ENTRY_KIND_DRIVE if self.is_drive else entry_kind
+        self.drive_type = drive_type
+        self.total_bytes = total_bytes
+        self.total_free_bytes = total_free_bytes
+        self.caller_free_bytes = caller_free_bytes
+        self.volume_label = volume_label
+        self.filesystem_name = filesystem_name
 
     @property
     def is_dir(self) -> bool:
-        return self.entry_kind == ENTRY_KIND_FILE and self.find_data.is_directory
+        return bool(self.file_attributes & FILE_ATTRIBUTE_DIRECTORY)
 
     @property
     def is_file(self) -> bool:
-        return self.entry_kind == ENTRY_KIND_FILE and not self.find_data.is_directory
+        return not self.is_dir and not self.is_drive
 
-    def pack(self, encoding: str = "utf-8") -> bytes:
-        """Packs into exactly 552 bytes."""
-        fd_bytes = self.find_data.pack(encoding=encoding)
+    @property
+    def is_directory(self) -> bool:
+        return self.is_dir
 
-        vol_bytes = self.volume_label.encode(encoding, errors="replace")[:99] + b"\x00"
-        vol_field = vol_bytes.ljust(100, b"\x00")
+    @property
+    def alternate_filename(self) -> str:
+        return ""
 
-        fs_bytes = self.filesystem_name.encode(encoding, errors="replace")[:99] + b"\x00"
-        fs_field = fs_bytes.ljust(100, b"\x00")
+    @property
+    def find_data(self) -> "Entry552":
+        """Backward-compatible find_data accessor."""
+        return self
 
-        part1 = struct.pack("<I", self.entry_kind) + fd_bytes
-        part2 = struct.pack(
-            "<IQQQ",
-            self.drive_type,
-            self.total_bytes,
-            self.total_free_bytes,
-            self.caller_free_bytes,
+    def pack(self, encoding: str = "utf-16le") -> bytes:
+        """Packs into exactly 552 bytes according to WIN32_FIND_DATAW layout."""
+        size_high = (self.file_size >> 32) & 0xFFFFFFFF
+        size_low = self.file_size & 0xFFFFFFFF
+
+        fn_encoded = self.filename.encode("utf-16le")[:512]
+        c_file_name_len = len(fn_encoded)
+        fn_field = fn_encoded.ljust(512, b"\x00")
+
+        header = struct.pack(
+            "<IQQQIII",
+            self.file_attributes,
+            self.creation_time,
+            self.last_access_time,
+            self.last_write_time,
+            size_high,
+            size_low,
+            c_file_name_len,
         )
-        entry = part1 + part2 + vol_field + fs_field
+        entry = header + fn_field
         if len(entry) != DIR_ENTRY_SIZE:
             raise ValueError(f"Packed entry size mismatch: {len(entry)} != {DIR_ENTRY_SIZE}")
         return entry
 
     @classmethod
-    def unpack(cls, data: bytes, encoding: str = "utf-8") -> "Entry552":
+    def unpack(cls, data: bytes, encoding: str = "utf-16le") -> "Entry552":
         """Unpacks 552 bytes into an Entry552 instance."""
         if len(data) < DIR_ENTRY_SIZE:
             raise ValueError(
                 f"Expected at least {DIR_ENTRY_SIZE} bytes for Entry552, got {len(data)}"
             )
 
-        entry_kind = struct.unpack_from("<I", data, 0)[0]
-        find_data = Win32FindData.unpack(data[4 : 4 + WIN32_FIND_DATA_SIZE], encoding=encoding)
+        (
+            attrs,
+            cr_time,
+            acc_time,
+            wr_time,
+            size_high,
+            size_low,
+            name_len,
+        ) = struct.unpack_from("<IQQQIII", data, 0)
 
-        offset = 4 + WIN32_FIND_DATA_SIZE
-        drive_type, total_b, free_b, caller_b = struct.unpack_from("<IQQQ", data, offset)
-
-        vol_raw = data[offset + 28 : offset + 28 + 100]
-        vol_label = vol_raw.split(b"\x00", 1)[0].decode(encoding, errors="replace")
-
-        fs_raw = data[offset + 128 : offset + 128 + 100]
-        fs_name = fs_raw.split(b"\x00", 1)[0].decode(encoding, errors="replace")
+        file_size = (size_high << 32) | size_low
+        raw_name = data[40 : 40 + min(name_len, 512)]
+        fn = raw_name.decode("utf-16le", errors="replace").rstrip("\x00")
 
         return cls(
-            entry_kind=entry_kind,
-            find_data=find_data,
-            drive_type=drive_type,
-            total_bytes=total_b,
-            total_free_bytes=free_b,
-            caller_free_bytes=caller_b,
-            volume_label=vol_label,
-            filesystem_name=fs_name,
+            filename=fn,
+            file_attributes=attrs,
+            creation_time=cr_time,
+            last_access_time=acc_time,
+            last_write_time=wr_time,
+            file_size=file_size,
         )
 
 
@@ -217,15 +271,15 @@ def make_file_entry(
     at = unix_to_filetime(atime if atime is not None else now)
 
     attrs = FILE_ATTRIBUTE_DIRECTORY if is_dir else FILE_ATTRIBUTE_NORMAL
-    fd = Win32FindData(
+    return Entry552(
+        filename=name,
         file_attributes=attrs,
         creation_time=ct,
         last_access_time=at,
         last_write_time=mt,
         file_size=0 if is_dir else size,
-        filename=name,
+        is_drive=False,
     )
-    return Entry552(entry_kind=ENTRY_KIND_FILE, find_data=fd)
 
 
 def make_drive_entry(
@@ -237,13 +291,11 @@ def make_drive_entry(
     fs_name: str = "NTFS",
 ) -> Entry552:
     """Helper to create a drive/volume Entry552."""
-    fd = Win32FindData(
-        file_attributes=FILE_ATTRIBUTE_DIRECTORY,
-        filename=name,
-    )
     return Entry552(
+        filename=name,
+        file_attributes=FILE_ATTRIBUTE_DIRECTORY,
+        is_drive=True,
         entry_kind=ENTRY_KIND_DRIVE,
-        find_data=fd,
         drive_type=drive_type,
         total_bytes=total_bytes,
         total_free_bytes=free_bytes,

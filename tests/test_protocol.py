@@ -27,12 +27,12 @@ from openeasysync.constants import (
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
     REPLY_DOWNLOAD_SINGLE,
-    REPLY_ERROR_CODE,
     REPLY_LISTING,
     REPLY_PRECHECK_BATCH,
     REPLY_PRECHECK_BATCH_EXT,
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
+    STATUS_ERROR,
     STATUS_OK,
 )
 from openeasysync.protocol.commands import (
@@ -82,21 +82,15 @@ from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
 
 def test_command_encoders_and_decoders():
     """Verify all Client Commands encode and decode correctly."""
-    # 0x01 Query Root (default path is "\" for EasySuite.exe compatibility)
+    # 0x01 Query Root (11 bytes total for default host query)
     raw01 = encode_query_root()
-    assert len(raw01) == 6
-    assert raw01 == bytes([OP_QUERY_ROOT, 0x00, 0x00, 0x00, 0x01, ord("\\")])
+    assert len(raw01) == 11
+    assert raw01 == bytes([OP_QUERY_ROOT, 0x07, 0xE4, 0x04, 0x06]) + b"TXLIN1"
     c01 = decode_command(raw01)
     assert c01["opcode"] == OP_QUERY_ROOT
-    assert c01["path"] == "\\"
-
-    # 0x01 Query Root with empty path
-    raw01_empty = encode_query_root("")
-    assert len(raw01_empty) == 5
-    assert raw01_empty == bytes([OP_QUERY_ROOT, 0x00, 0x00, 0x00, 0x00])
-    c01_empty = decode_command(raw01_empty)
-    assert c01_empty["opcode"] == OP_QUERY_ROOT
-    assert c01_empty["path"] == ""
+    assert c01["computer_name"] == "TXLIN1"
+    assert c01["flags"] == 0x07
+    assert c01["code_page"] == 1252
 
     # Test backwards-compatible 1-byte decode
     assert decode_command(bytes([OP_QUERY_ROOT]))["opcode"] == OP_QUERY_ROOT
@@ -222,20 +216,32 @@ def test_command_encoders_and_decoders():
 
 def test_reply_encoders_and_decoders():
     """Verify all Server Replies encode and decode correctly."""
-    # 0xA1 Status ACK
-    r_a1 = decode_reply(encode_status_ack(STATUS_OK))
-    assert r_a1["opcode"] == REPLY_STATUS_ACK and r_a1["status"] == STATUS_OK
+    # 0xA1 Status ACK (24-byte structured ACK)
+    raw_a1 = encode_status_ack(req_opcode=OP_NOTIFY_ACTIVE_DIR, status=STATUS_OK)
+    assert len(raw_a1) == 24
+    r_a1 = decode_reply(raw_a1)
+    assert r_a1["opcode"] == REPLY_STATUS_ACK
+    assert r_a1["status"] == STATUS_OK
+    assert r_a1["req_opcode"] == OP_NOTIFY_ACTIVE_DIR
 
-    # 0xA2 Error Code
-    r_a2 = decode_reply(encode_error_code(112))
-    assert r_a2["opcode"] == REPLY_ERROR_CODE and r_a2["win32_error"] == 112
+    # Error Code (encoded via 24-byte 0xA1 structured response)
+    raw_err = encode_error_code(112, req_opcode=OP_LIST_DIR)
+    assert len(raw_err) == 24
+    r_err = decode_reply(raw_err)
+    assert r_err["opcode"] == REPLY_STATUS_ACK
+    assert r_err["status"] == STATUS_ERROR
+    assert r_err["win32_error"] == 112
+    assert r_err["req_opcode"] == OP_LIST_DIR
 
-    # 0xA3 Listing
+    # 0xA2 Listing (formerly 0xA3)
     entry = make_file_entry("sample.txt", size=500)
-    r_a3 = decode_reply(encode_listing_reply([entry]))
-    assert r_a3["opcode"] == REPLY_LISTING
-    assert len(r_a3["entries"]) == 1
-    assert r_a3["entries"][0].find_data.filename == "sample.txt"
+    raw_listing = encode_listing_reply([entry])
+    assert raw_listing[0] == REPLY_LISTING
+    assert raw_listing[0] == 0xA2
+    r_a2 = decode_reply(raw_listing)
+    assert r_a2["opcode"] == REPLY_LISTING
+    assert len(r_a2["entries"]) == 1
+    assert r_a2["entries"][0].filename == "sample.txt"
 
     # 0xA4 Roots Reply
     r_roots = decode_reply(encode_roots_reply([("C", 3), ("D", 2)]))

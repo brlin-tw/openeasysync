@@ -11,9 +11,9 @@ from openeasysync.constants import (
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
+    REPLY_DOWNLOAD_CHUNK,
     REPLY_DOWNLOAD_SINGLE,
     REPLY_DOWNLOAD_UNREADABLE,
-    REPLY_ERROR_CODE,
     REPLY_FORMATTED_ERROR,
     REPLY_LISTING,
     REPLY_PRECHECK_BATCH,
@@ -21,6 +21,8 @@ from openeasysync.constants import (
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
     REPLY_UPLOAD_BATCH_ERROR,
+    STATUS_ERROR,
+    STATUS_OK,
     WIN32_FIND_DATA_SIZE,
 )
 from openeasysync.protocol.directory_entry import Entry552, Win32FindData
@@ -49,23 +51,57 @@ class BatchPrecheckExtConflict:
 # Encoders
 
 
-def encode_status_ack(status_code: int) -> bytes:
-    """Opcode 0xA1: Command Status / ACK."""
-    return bytes([REPLY_STATUS_ACK, status_code & 0xFF])
+def encode_status_ack(
+    status: int = STATUS_OK,
+    req_opcode: int = 0,
+    req_id: int = 0,
+    win32_error: int = 0,
+) -> bytes:
+    """Opcode 0xA1: Command Status / ACK (24-byte structured response header)."""
+    return bytes([REPLY_STATUS_ACK, req_opcode & 0xFF, status & 0xFF]) + struct.pack(
+        "<II13s", req_id & 0xFFFFFFFF, win32_error & 0xFFFFFFFF, b"\x00" * 13
+    )
 
 
-def encode_error_code(win32_error: int) -> bytes:
-    """Opcode 0xA2: Win32 Error Code."""
-    return bytes([REPLY_ERROR_CODE]) + struct.pack("<I", win32_error & 0xFFFFFFFF)
+def encode_error_code(win32_error: int, req_opcode: int = 0, req_id: int = 0) -> bytes:
+    """Encodes an error reply using the 24-byte 0xA1 structured response.
+
+    Note: Opcode 0xA2 is reserved strictly for Directory Listings (Entry552).
+    Emitting a short error reply with opcode 0xA2 is a protocol violation that
+    causes peer memory corruption. Error replies MUST use 0xA1 with status=1.
+    """
+    return encode_status_ack(
+        status=STATUS_ERROR,
+        req_opcode=req_opcode,
+        req_id=req_id,
+        win32_error=win32_error,
+    )
 
 
-def encode_listing_reply(entries: list[Entry552], encoding: str = "utf-8") -> bytes:
-    """Opcode 0xA3: Directory / Drive Listing Reply."""
+def encode_listing_reply(entries: list[Entry552], encoding: str = "utf-16le") -> bytes:
+    """Opcode 0xA2: Directory Listing Reply.
+
+    Framing: [0xA2][entry_count:uint16_le][entries: Entry552[entry_count]]
+    Total length = 3 + 552 * entry_count bytes.
+    """
     body = bytearray([REPLY_LISTING])
-    body.extend(struct.pack("<I", len(entries)))
+    body.extend(struct.pack("<H", len(entries)))
     for e in entries:
         body.extend(e.pack(encoding=encoding))
     return bytes(body)
+
+
+def encode_download_chunk(
+    item_id: int,
+    chunk_index: int,
+    total_chunks: int,
+    chunk_data: bytes,
+) -> bytes:
+    """Opcode 0xA3: File Download Data Chunk."""
+    header = bytes([REPLY_DOWNLOAD_CHUNK]) + struct.pack(
+        "<IIII", item_id, chunk_index, total_chunks, len(chunk_data)
+    )
+    return header + chunk_data
 
 
 def encode_roots_reply(drives: list[tuple[str, int]]) -> bytes:
@@ -118,9 +154,9 @@ def encode_download_batch_empty(
     return bytes(body)
 
 
-def encode_download_batch_done() -> bytes:
-    """Opcode 0xA7: Batch Download Complete."""
-    return bytes([REPLY_DOWNLOAD_BATCH_DONE])
+def encode_download_batch_done(req_id: int = 0, status: int = 0) -> bytes:
+    """Opcode 0xA7: Batch Download Complete ACK (7 bytes total)."""
+    return bytes([REPLY_DOWNLOAD_BATCH_DONE]) + struct.pack("<IH", req_id, status)
 
 
 def encode_precheck_batch_reply(conflicts: list[str], encoding: str = "utf-8") -> bytes:
@@ -185,22 +221,53 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
     opcode = payload[0]
 
     if opcode == REPLY_STATUS_ACK:
+        if len(payload) >= 11:
+            req_op, status_code = payload[1], payload[2]
+            req_id, win32_err = struct.unpack_from("<II", payload, 3)
+            return {
+                "opcode": REPLY_STATUS_ACK,
+                "req_opcode": req_op,
+                "status": status_code,
+                "req_id": req_id,
+                "win32_error": win32_err,
+            }
         status_code = payload[1] if len(payload) > 1 else 0
-        return {"opcode": REPLY_STATUS_ACK, "status": status_code}
-
-    if opcode == REPLY_ERROR_CODE:
-        win32_err = struct.unpack_from("<I", payload, 1)[0]
-        return {"opcode": REPLY_ERROR_CODE, "win32_error": win32_err}
+        return {
+            "opcode": REPLY_STATUS_ACK,
+            "req_opcode": 0,
+            "status": status_code,
+            "req_id": 0,
+            "win32_error": 0,
+        }
 
     if opcode == REPLY_LISTING:
-        entry_count = struct.unpack_from("<I", payload, 1)[0]
-        entries: list[Entry552] = []
-        offset = 5
-        for _ in range(entry_count):
-            entry_bytes = payload[offset : offset + DIR_ENTRY_SIZE]
-            entries.append(Entry552.unpack(entry_bytes, encoding=encoding))
-            offset += DIR_ENTRY_SIZE
-        return {"opcode": REPLY_LISTING, "entries": entries}
+        # Opcode 0xA2: Directory Listing Reply with 16-bit entry_count
+        if len(payload) >= 3:
+            entry_count = struct.unpack_from("<H", payload, 1)[0]
+            entries: list[Entry552] = []
+            offset = 3
+            for _ in range(entry_count):
+                if offset + DIR_ENTRY_SIZE > len(payload):
+                    break
+                entry_bytes = payload[offset : offset + DIR_ENTRY_SIZE]
+                entries.append(Entry552.unpack(entry_bytes, encoding=encoding))
+                offset += DIR_ENTRY_SIZE
+            return {"opcode": REPLY_LISTING, "entries": entries}
+        return {"opcode": REPLY_LISTING, "entries": []}
+
+    if opcode == REPLY_DOWNLOAD_CHUNK:
+        # Opcode 0xA3: File Download Data Chunk
+        if len(payload) >= 17:
+            item_id, chunk_index, total_chunks, data_len = struct.unpack_from("<IIII", payload, 1)
+            chunk_data = payload[17 : 17 + data_len]
+            return {
+                "opcode": REPLY_DOWNLOAD_CHUNK,
+                "item_id": item_id,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "data": chunk_data,
+            }
+        return {"opcode": opcode, "raw": payload}
 
     if opcode in (REPLY_ROOTS, REPLY_DOWNLOAD_SINGLE):
         # Distinguish between Root Drive Listing (0xA4) and Single File Download (0xA4):
@@ -261,7 +328,10 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         return {"opcode": REPLY_DOWNLOAD_BATCH_EMPTY, "records": empty_records}
 
     if opcode == REPLY_DOWNLOAD_BATCH_DONE:
-        return {"opcode": REPLY_DOWNLOAD_BATCH_DONE}
+        if len(payload) >= 7:
+            req_id, status_val = struct.unpack_from("<IH", payload, 1)
+            return {"opcode": REPLY_DOWNLOAD_BATCH_DONE, "req_id": req_id, "status": status_val}
+        return {"opcode": REPLY_DOWNLOAD_BATCH_DONE, "req_id": 0, "status": 0}
 
     if opcode == REPLY_PRECHECK_BATCH:
         count = struct.unpack_from("<I", payload, 1)[0]

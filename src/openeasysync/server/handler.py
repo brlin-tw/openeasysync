@@ -61,6 +61,7 @@ from openeasysync.protocol.replies import (
     encode_listing_reply,
     encode_precheck_batch_ext_reply,
     encode_precheck_batch_reply,
+    encode_roots_reply,
     encode_status_ack,
     encode_upload_batch_error,
 )
@@ -84,14 +85,16 @@ class PeerServerHandler:
         opcode = cmd["opcode"]
 
         if opcode == OP_QUERY_ROOT:
-            return [self._handle_query_root()]
+            return self._handle_query_root()
 
         if opcode in (OP_NOTIFY_ACTIVE_DIR, OP_VERIFY_PEER_NAME):
             self.peer_active_dir = cmd.get("path", "")
-            return [encode_status_ack(STATUS_ACTIVE_DIR_ACK)]
+            return [
+                encode_status_ack(req_opcode=OP_NOTIFY_ACTIVE_DIR, status=STATUS_ACTIVE_DIR_ACK)
+            ]
 
         if opcode == OP_LIST_DIR:
-            return [self._handle_list_dir(cmd["path"])]
+            return self._handle_list_dir(cmd["path"])
 
         if opcode == OP_DELETE_FILE:
             return [self._handle_delete_file(cmd["path"])]
@@ -143,50 +146,17 @@ class PeerServerHandler:
 
         return [encode_error_code(1)]  # ERROR_INVALID_FUNCTION
 
-    def _handle_query_root(self) -> bytes:
-        drives: list[Entry552] = []
+    def _handle_query_root(self) -> list[bytes]:
+        roots: list[tuple[str, int]] = []
         if sys.platform == "win32":
             import string
 
             for letter in string.ascii_uppercase:
                 root = f"{letter}:\\"
                 if os.path.exists(root):
-                    try:
-                        usage = shutil.disk_usage(root)
-                        drives.append(
-                            make_drive_entry(
-                                root,
-                                drive_type=DRIVE_FIXED,
-                                total_bytes=usage.total,
-                                free_bytes=usage.free,
-                                label="Local Disk",
-                                fs_name="NTFS",
-                            )
-                        )
-                    except Exception:
-                        pass
+                    roots.append((letter, DRIVE_FIXED))
         else:
-            # Unix: Emulate C:\ as Root (or virtual root)
-            local_root = self.mapper.virtual_root if self.mapper.virtual_root else "/"
-            try:
-                usage = shutil.disk_usage(local_root)
-                total_b = usage.total
-                free_b = usage.free
-            except Exception:
-                total_b = 100 * 1024 * 1024 * 1024
-                free_b = 50 * 1024 * 1024 * 1024
-
-            drives.append(
-                make_drive_entry(
-                    "C:\\",
-                    drive_type=DRIVE_FIXED,
-                    total_bytes=total_b,
-                    free_bytes=free_b,
-                    label="Root Filesystem",
-                    fs_name="ext4",
-                )
-            )
-
+            roots.append(("C", DRIVE_FIXED))
             # Check /media or /mnt for mounted removable drives
             for mnt_dir in ("/media", "/mnt"):
                 if os.path.isdir(mnt_dir):
@@ -194,31 +164,21 @@ class PeerServerHandler:
                         for entry in os.listdir(mnt_dir):
                             full_mnt = os.path.join(mnt_dir, entry)
                             if os.path.ismount(full_mnt):
-                                try:
-                                    u = shutil.disk_usage(full_mnt)
-                                    drives.append(
-                                        make_drive_entry(
-                                            f"D:\\{entry}",
-                                            drive_type=DRIVE_REMOVABLE,
-                                            total_bytes=u.total,
-                                            free_bytes=u.free,
-                                            label=entry,
-                                            fs_name="FAT32",
-                                        )
-                                    )
-                                except Exception:
-                                    pass
+                                roots.append(("D", DRIVE_REMOVABLE))
+                                break
                     except Exception:
                         pass
 
-        return encode_listing_reply(drives)
+        ack = encode_status_ack(req_opcode=OP_QUERY_ROOT, status=STATUS_OK)
+        reply = encode_roots_reply(roots)
+        return [ack, reply]
 
-    def _handle_list_dir(self, dir_path: str) -> bytes:
+    def _handle_list_dir(self, dir_path: str) -> list[bytes]:
         local_path = self.mapper.wire_to_local(dir_path)
         if not os.path.exists(local_path):
-            return encode_error_code(3)  # ERROR_PATH_NOT_FOUND
+            return [encode_error_code(3, req_opcode=OP_LIST_DIR)]  # ERROR_PATH_NOT_FOUND
         if not os.path.isdir(local_path):
-            return encode_error_code(267)  # ERROR_DIRECTORY
+            return [encode_error_code(267, req_opcode=OP_LIST_DIR)]  # ERROR_DIRECTORY
 
         entries: list[Entry552] = []
         try:
@@ -239,12 +199,14 @@ class PeerServerHandler:
                     except Exception:
                         continue
             # Sort directories first, then alphabetical
-            entries.sort(key=lambda x: (not x.is_dir, x.find_data.filename.lower()))
-            return encode_listing_reply(entries)
+            entries.sort(key=lambda x: (not x.is_dir, x.filename.lower()))
+            ack = encode_status_ack(req_opcode=OP_LIST_DIR, status=STATUS_OK)
+            rep = encode_listing_reply(entries)
+            return [ack, rep]
         except PermissionError:
-            return encode_error_code(5)  # ERROR_ACCESS_DENIED
+            return [encode_error_code(5, req_opcode=OP_LIST_DIR)]  # ERROR_ACCESS_DENIED
         except Exception:
-            return encode_error_code(3)
+            return [encode_error_code(3, req_opcode=OP_LIST_DIR)]
 
     def _handle_delete_file(self, file_path: str) -> bytes:
         local_path = self.mapper.wire_to_local(file_path)
