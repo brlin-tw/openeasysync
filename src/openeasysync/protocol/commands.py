@@ -13,6 +13,8 @@ from openeasysync.constants import (
     OP_DELETE_FILE,
     OP_DOWNLOAD_BATCH,
     OP_DOWNLOAD_SINGLE,
+    OP_EXTENDED_XML_MAX,
+    OP_EXTENDED_XML_MIN,
     OP_LIST_DIR,
     OP_PRECHECK_BATCH,
     OP_PRECHECK_BATCH_EXT,
@@ -213,6 +215,14 @@ def encode_query_errors(error_codes: list[int]) -> bytes:
     return bytes(body)
 
 
+def encode_extended_xml(opcode: int, xml_content: str) -> bytes:
+    """Opcode 0x32..0x39: Extended XML Command."""
+    xml_b = xml_content.encode("ascii", errors="replace")
+    if not xml_b.endswith(b"\x00"):
+        xml_b += b"\x00"
+    return bytes([opcode]) + xml_b
+
+
 # Decoders
 
 
@@ -333,5 +343,9 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         count = struct.unpack_from("<I", payload, 1)[0]
         codes = [struct.unpack_from("<I", payload, 5 + i * 4)[0] for i in range(count)]
         return {"opcode": OP_QUERY_ERRORS, "error_codes": codes}
+
+    if OP_EXTENDED_XML_MIN <= opcode <= OP_EXTENDED_XML_MAX:
+        xml_str = payload[1:].decode("ascii", errors="replace").rstrip("\x00")
+        return {"opcode": opcode, "xml": xml_str}
 
     return {"opcode": opcode, "raw": payload}

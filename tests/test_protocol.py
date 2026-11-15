@@ -21,6 +21,7 @@ from openeasysync.constants import (
     OP_SET_MAC_MODE,
     OP_UPLOAD_BATCH,
     OP_UPLOAD_SINGLE,
+    OP_VNIC_SWITCH,
     OP_XML_CONTROL,
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
@@ -44,6 +45,7 @@ from openeasysync.protocol.commands import (
     encode_delete_file,
     encode_download_batch,
     encode_download_single,
+    encode_extended_xml,
     encode_list_dir,
     encode_precheck_batch,
     encode_precheck_batch_ext,
@@ -196,6 +198,26 @@ def test_command_encoders_and_decoders():
     assert c17["opcode"] == OP_QUERY_ERRORS
     assert c17["error_codes"] == [5, 112]
 
+    # 0x32 Virtual NIC Switch XML
+    c32 = decode_command(
+        encode_extended_xml(
+            OP_VNIC_SWITCH,
+            "<ExtraXmlCommand>PleaseSwitchAsVirtualNIC</ExtraXmlCommand>",
+        )
+    )
+    assert c32["opcode"] == OP_VNIC_SWITCH
+    assert "<ExtraXmlCommand>PleaseSwitchAsVirtualNIC</ExtraXmlCommand>" in c32["xml"]
+
+    # 0x39 Extended XML Command Channel
+    c39 = decode_command(
+        encode_extended_xml(
+            0x39,
+            "<ExtraXmlCommand>LocalLibraryInformation</ExtraXmlCommand>",
+        )
+    )
+    assert c39["opcode"] == 0x39
+    assert "<ExtraXmlCommand>LocalLibraryInformation</ExtraXmlCommand>" in c39["xml"]
+
 
 def test_reply_encoders_and_decoders():
     """Verify all Server Replies encode and decode correctly."""
@@ -280,3 +302,32 @@ def test_path_mapper():
 
     wire = mapper.local_to_wire("/tmp/virtual_test/folder/file.txt")
     assert wire == "C:\\folder\\file.txt"
+
+
+def test_peer_server_handler_extended_xml():
+    """Verify PeerServerHandler responds to 0x32..0x39 Extended XML commands."""
+    from openeasysync.server.handler import PeerServerHandler
+
+    handler = PeerServerHandler()
+
+    # 0x32 Virtual NIC mode switch request -> Reject
+    req_32 = encode_extended_xml(
+        OP_VNIC_SWITCH,
+        "<ExtraXmlCommand>PleaseSwitchAsVirtualNIC</ExtraXmlCommand>",
+    )
+    rep_32 = handler.handle_command(req_32)
+    assert len(rep_32) == 1
+    dec_32 = decode_command(rep_32[0])
+    assert dec_32["opcode"] == OP_VNIC_SWITCH
+    assert "RejectSwitchAsVirtualNIC" in dec_32["xml"]
+
+    # 0x39 Extended XML request (e.g. LocalLibraryInformation) -> Acknowledge OK
+    req_39 = encode_extended_xml(
+        0x39,
+        "<ExtraXmlCommand>LocalLibraryInformation</ExtraXmlCommand>",
+    )
+    rep_39 = handler.handle_command(req_39)
+    assert len(rep_39) == 1
+    dec_39 = decode_command(rep_39[0])
+    assert dec_39["opcode"] == 0x39
+    assert "<ExtraXmlCommand>OK</ExtraXmlCommand>" in dec_39["xml"]

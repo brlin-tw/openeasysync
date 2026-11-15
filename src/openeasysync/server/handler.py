@@ -16,6 +16,8 @@ from openeasysync.constants import (
     OP_DELETE_FILE,
     OP_DOWNLOAD_BATCH,
     OP_DOWNLOAD_SINGLE,
+    OP_EXTENDED_XML_MAX,
+    OP_EXTENDED_XML_MIN,
     OP_LIST_DIR,
     OP_PRECHECK_BATCH,
     OP_PRECHECK_BATCH_EXT,
@@ -27,6 +29,7 @@ from openeasysync.constants import (
     OP_SET_MAC_MODE,
     OP_UPLOAD_BATCH,
     OP_UPLOAD_SINGLE,
+    OP_VNIC_SWITCH,
     OP_XML_CONTROL,
     STATUS_EXISTS,
     STATUS_MAC_MODE_ACK,
@@ -34,7 +37,7 @@ from openeasysync.constants import (
     STATUS_UPLOAD_BATCH_DONE,
     STATUS_UPLOAD_SINGLE_DONE,
 )
-from openeasysync.protocol.commands import decode_command
+from openeasysync.protocol.commands import decode_command, encode_extended_xml
 from openeasysync.protocol.directory_entry import (
     Entry552,
     Win32FindData,
@@ -130,6 +133,9 @@ class PeerServerHandler:
 
         if opcode == OP_XML_CONTROL:
             return [self._handle_xml_control(cmd["xml"])]
+
+        if OP_EXTENDED_XML_MIN <= opcode <= OP_EXTENDED_XML_MAX:
+            return [self._handle_extended_xml(opcode, cmd.get("xml", ""))]
 
         return [encode_error_code(1)]  # ERROR_INVALID_FUNCTION
 
@@ -484,3 +490,11 @@ class PeerServerHandler:
         from openeasysync.protocol.commands import encode_xml_control
 
         return encode_xml_control(reply_xml)
+
+    def _handle_extended_xml(self, opcode: int, xml_content: str) -> bytes:
+        """Handles incoming 0x32..0x39 Extended XML commands from peer."""
+        if opcode == OP_VNIC_SWITCH and "PleaseSwitchAsVirtualNIC" in xml_content:
+            return encode_extended_xml(
+                opcode, "<ExtraXmlCommand>RejectSwitchAsVirtualNIC</ExtraXmlCommand>"
+            )
+        return encode_extended_xml(opcode, "<ExtraXmlCommand>OK</ExtraXmlCommand>")
