@@ -184,3 +184,12 @@ def test_query_roots_wire_format_reply_roots():
 
     assert roots[1].find_data.filename == "D:\\"
     assert roots[1].drive_type == 2
+
+
+def test_session_wait_settled(dual_host_setup):
+    """Verify SessionManager.wait_settled monitors link quieting."""
+    session_a = dual_host_setup["session_a"]
+
+    # When quiescent, wait_settled finishes quickly
+    settled = session_a.wait_settled(quiet_interval_s=0.05, timeout_s=0.5, min_settle_s=0.02)
+    assert settled is True

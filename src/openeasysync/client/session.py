@@ -43,24 +43,36 @@ class SessionManager:
         self.reassembler = PacketReassembler()
         self.poller = LinkPoller(
             transport=self.transport,
-            on_activity=self.on_activity,
+            on_activity=self._on_internal_activity,
         )
 
         self._lock = threading.RLock()
         self._is_connected = False
         self._running = False
         self._dispatcher_thread: threading.Thread | None = None
+        self._last_rx_time: float = 0.0
+        self._last_activity_time: float = 0.0
 
         # Request-reply coordination: pending reply queue for synchronous client calls
         self._reply_queue: queue.Queue[bytes] = queue.Queue()
         self._streaming_queue: queue.Queue[bytes] = queue.Queue()
         self._active_stream_callback: Callable[[bytes], None] | None = None
 
+    def _on_internal_activity(self) -> None:
+        self._last_activity_time = time.time()
+        if self.on_activity:
+            self.on_activity()
+
     @property
     def is_connected(self) -> bool:
         return self._is_connected
 
-    def connect(self, timeout_ms: int = 5000) -> bool:
+    def connect(
+        self,
+        timeout_ms: int = 5000,
+        settle_delay_s: float = 0.1,
+        wait_settle: bool = True,
+    ) -> bool:
         """Executes the standard hardware init handshake and XML connect."""
         # 1. 0xF0 Identify
         self.transport.identify()
@@ -80,7 +92,6 @@ class SessionManager:
 
         # 6. Enter Transfer Line Mode (0x007F)
         self.transport.set_mode(MODE_TRANSFER_LINE)
-        time.sleep(0.05)
 
         # 7. Start Poller and Dispatcher
         self._running = True
@@ -91,9 +102,42 @@ class SessionManager:
         )
         self._dispatcher_thread.start()
 
+        # 8. Settle link and wait for peer startup handshake to complete
+        if wait_settle:
+            self.wait_settled(quiet_interval_s=0.25, timeout_s=1.5, min_settle_s=settle_delay_s)
+
         self._is_connected = True
         if self.on_connection_change:
             self.on_connection_change(True)
+        return True
+
+    def wait_settled(
+        self,
+        quiet_interval_s: float = 0.25,
+        timeout_s: float = 1.5,
+        min_settle_s: float = 0.1,
+    ) -> bool:
+        """Waits for link and peer initialization activity to settle.
+
+        Monitors the link until no incoming peer commands have arrived for at
+        least `quiet_interval_s`, or until `timeout_s` expires. A minimum
+        delay of `min_settle_s` is observed to allow peer detection.
+        """
+        start = time.time()
+        if min_settle_s > 0:
+            time.sleep(min_settle_s)
+
+        while time.time() - start < timeout_s:
+            with self.poller._lock:
+                tx_pending = len(self.poller._tx_deque)
+            rx_pending = self.poller.rx_queue.qsize()
+
+            time_since_last_rx = time.time() - self._last_rx_time
+
+            if tx_pending == 0 and rx_pending == 0 and time_since_last_rx >= quiet_interval_s:
+                return True
+            time.sleep(0.05)
+
         return True
 
     def disconnect(self) -> None:
@@ -131,6 +175,12 @@ class SessionManager:
                     self._reply_queue.get_nowait()
                 except queue.Empty:
                     break
+
+            # If peer sent a command recently, wait briefly for our reply to transmit
+            # and link to stabilize to prevent half-duplex collisions
+            elapsed = time.time() - self._last_rx_time
+            if elapsed < 0.1:
+                time.sleep(0.1 - elapsed)
 
             # Split logical command into 64 KB blocks
             blocks = self.splitter.split_message(cmd_payload)
@@ -221,6 +271,7 @@ class SessionManager:
         if not message:
             return
 
+        self._last_rx_time = time.time()
         opcode = message[0]
         logger.debug("Received complete wire message: opcode=%#04x, len=%d", opcode, len(message))
 
