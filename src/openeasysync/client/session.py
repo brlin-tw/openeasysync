@@ -145,20 +145,23 @@ class SessionManager:
         if not self._running:
             return
 
-        try:
-            self.transport.set_mode(MODE_OFFLINE)
-        except Exception:
-            pass
-
         self._running = False
         self._is_connected = False
         if self.on_connection_change:
             self.on_connection_change(False)
 
+        # 1. Stop background poller and dispatcher threads before altering hardware mode
         self.poller.stop()
         if self._dispatcher_thread and self._dispatcher_thread.is_alive():
             self._dispatcher_thread.join(timeout=1.0)
 
+        # 2. Put hardware bridge into offline mode
+        try:
+            self.transport.set_mode(MODE_OFFLINE)
+        except Exception:
+            pass
+
+        # 3. Close transport handle
         self.transport.close()
 
     def send_command(
