@@ -12,6 +12,7 @@ from openeasysync.constants import (
     MODE_OFFLINE,
     MODE_TRANSFER_LINE,
     REPLY_STATUS_ACK,
+    STATUS_OK,
 )
 from openeasysync.framing.poller import LinkPoller
 from openeasysync.framing.reassembler import PacketReassembler
@@ -205,18 +206,25 @@ class SessionManager:
                 try:
                     reply = self._reply_queue.get(timeout=remaining)
                     opcode = reply[0]
-                    # If an intermediate ACK was received but caller expects a specific data reply
+                    # If an intermediate positive ACK was received but caller expects a specific data reply
                     if (
                         expected_opcodes
                         and opcode == REPLY_STATUS_ACK
                         and REPLY_STATUS_ACK not in expected_opcodes
                     ):
-                        logger.debug(
-                            "Received intermediate ACK %#04x, continuing to wait for %s...",
-                            opcode,
-                            [f"{op:#04x}" for op in expected_opcodes],
+                        status = (
+                            reply[2]
+                            if len(reply) >= 3
+                            else (reply[1] if len(reply) > 1 else STATUS_OK)
                         )
-                        continue
+                        if status == STATUS_OK:
+                            logger.debug(
+                                "Received intermediate ACK %#04x, continuing to wait for %s...",
+                                opcode,
+                                [f"{op:#04x}" for op in expected_opcodes],
+                            )
+                            continue
+                        # If status != STATUS_OK, it is an error reply; return it immediately
                     return reply
                 except queue.Empty:
                     break

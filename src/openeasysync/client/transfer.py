@@ -47,7 +47,7 @@ from openeasysync.protocol.directory_entry import (
     filetime_to_unix,
     unix_to_filetime,
 )
-from openeasysync.protocol.replies import decode_reply
+from openeasysync.protocol.replies import decode_reply, format_win32_error
 
 
 class TransferManager:
@@ -80,8 +80,12 @@ class TransferManager:
             return entries
         if rep["opcode"] == REPLY_LISTING:
             return rep["entries"]
+        if rep["opcode"] == REPLY_STATUS_ACK and rep.get("status") == STATUS_ERROR:
+            win32_err = rep.get("win32_error", 0)
+            raise OSError(f"Remote error querying roots: {format_win32_error(win32_err)}")
         if rep["opcode"] == REPLY_ERROR_CODE:
-            raise OSError(f"Remote error querying roots: {rep['win32_error']}")
+            win32_err = rep.get("win32_error", 0)
+            raise OSError(f"Remote error querying roots: {format_win32_error(win32_err)}")
         return []
 
     def notify_active_dir(self, remote_path: str) -> bool:
@@ -102,11 +106,13 @@ class TransferManager:
         if rep["opcode"] == REPLY_LISTING:
             return rep["entries"]
         if rep["opcode"] == REPLY_STATUS_ACK and rep.get("status") == STATUS_ERROR:
-            raise OSError(
-                f"Remote error listing '{remote_path}': Win32 error {rep.get('win32_error')}"
-            )
+            win32_err = rep.get("win32_error", 0)
+            err_desc = format_win32_error(win32_err)
+            raise OSError(f"{remote_path} : {err_desc}")
         if rep["opcode"] == REPLY_ERROR_CODE:
-            raise OSError(f"Remote error listing '{remote_path}': Win32 error {rep['win32_error']}")
+            win32_err = rep.get("win32_error", 0)
+            err_desc = format_win32_error(win32_err)
+            raise OSError(f"{remote_path} : {err_desc}")
         return []
 
     def create_dir(self, remote_path: str) -> bool:
@@ -184,9 +190,15 @@ class TransferManager:
         rep = decode_reply(rep_bytes)
 
         if rep["opcode"] == REPLY_STATUS_ACK:
+            if rep["status"] == STATUS_ERROR:
+                win32_err = rep.get("win32_error", 0)
+                raise OSError(
+                    f"Upload failed: {remote_dest_path} : {format_win32_error(win32_err)}"
+                )
             return rep["status"] in (STATUS_OK, STATUS_UPLOAD_SINGLE_DONE)
         if rep["opcode"] == REPLY_ERROR_CODE:
-            raise OSError(f"Upload failed: Win32 error {rep['win32_error']}")
+            win32_err = rep.get("win32_error", 0)
+            raise OSError(f"Upload failed: {remote_dest_path} : {format_win32_error(win32_err)}")
         return False
 
     def download_file(
@@ -200,8 +212,13 @@ class TransferManager:
         rep_bytes = self.session.send_command(cmd)
         rep = decode_reply(rep_bytes)
 
+        if rep["opcode"] == REPLY_STATUS_ACK and rep.get("status") == STATUS_ERROR:
+            win32_err = rep.get("win32_error", 0)
+            raise OSError(f"Download failed: {remote_src_path} : {format_win32_error(win32_err)}")
+
         if rep["opcode"] == REPLY_ERROR_CODE:
-            raise OSError(f"Download failed: Win32 error {rep['win32_error']}")
+            win32_err = rep.get("win32_error", 0)
+            raise OSError(f"Download failed: {remote_src_path} : {format_win32_error(win32_err)}")
 
         if rep["opcode"] == REPLY_DOWNLOAD_SINGLE:
             parent = os.path.dirname(local_dest_path)

@@ -3,6 +3,7 @@
 """Encoders and decoders for all Server Replies (0xA1..0xAC)."""
 
 import struct
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +47,43 @@ class BatchPrecheckExtConflict:
     rel_path: str
     peer_find_data: Win32FindData
     src_find_data: Win32FindData
+
+
+WIN32_ERROR_MESSAGES: dict[int, str] = {
+    0: "The operation completed successfully.",
+    1: "Incorrect function.",
+    2: "The system cannot find the file specified.",
+    3: "The system cannot find the path specified.",
+    4: "The system cannot open the file.",
+    5: "Access is denied.",
+    6: "The handle is invalid.",
+    15: "The system cannot find the drive specified.",
+    19: "The media is write protected.",
+    21: "The device is not ready.",
+    32: "The process cannot access the file because it is being used by another process.",
+    33: "The process cannot access the file because another process has locked a portion of the file.",
+    53: "The network path was not found.",
+    67: "The network name cannot be found.",
+    80: "The file exists.",
+    112: "There is not enough space on the disk.",
+    183: "Cannot create a file when that file already exists.",
+    206: "The filename or extension is too long.",
+    267: "The directory name is invalid.",
+}
+
+
+def format_win32_error(error_code: int) -> str:
+    """Returns a human-readable description for a Win32 error code."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            msg = ctypes.FormatError(error_code).strip()
+            if msg:
+                return msg
+        except Exception:
+            pass
+    return WIN32_ERROR_MESSAGES.get(error_code, f"Win32 error {error_code}")
 
 
 # Encoders

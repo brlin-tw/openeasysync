@@ -38,6 +38,7 @@ from openeasysync.protocol.directory_entry import (
 )
 from openeasysync.protocol.path_mapping import PathMapper
 from openeasysync.protocol.replies import (
+    WIN32_ERROR_MESSAGES,
     BatchDownloadEmptyRecord,
     BatchDownloadStreamRecord,
     BatchPrecheckExtConflict,
@@ -54,6 +55,7 @@ from openeasysync.protocol.replies import (
     encode_precheck_batch_reply,
     encode_status_ack,
     encode_upload_batch_error,
+    format_win32_error,
 )
 from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
 
@@ -104,6 +106,8 @@ __all__ = [
     "encode_download_unreadable",
     "encode_formatted_errors",
     "decode_reply",
+    "format_win32_error",
+    "WIN32_ERROR_MESSAGES",
     "build_oti_msg",
     "parse_oti_msg",
     "PathMapper",

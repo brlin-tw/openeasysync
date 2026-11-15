@@ -197,3 +197,13 @@ def test_session_wait_settled(dual_host_setup):
     # When quiescent, wait_settled finishes quickly
     settled = session_a.wait_settled(quiet_interval_s=0.05, timeout_s=0.5, min_settle_s=0.02)
     assert settled is True
+
+
+def test_e2e_list_dir_error_handling(dual_host_setup):
+    """Verify listing an invalid directory returns formatted Win32 error immediately without timeout."""
+    transfer_a = dual_host_setup["transfer_a"]
+
+    with pytest.raises(OSError) as exc_info:
+        transfer_a.list_dir("C:\\nonexistent_dir")
+    assert "The system cannot find the path specified." in str(exc_info.value)
+    assert "C:\\nonexistent_dir" in str(exc_info.value)

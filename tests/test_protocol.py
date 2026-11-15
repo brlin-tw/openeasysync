@@ -338,3 +338,15 @@ def test_peer_server_handler_extended_xml():
     dec_39 = decode_command(rep_39[0])
     assert dec_39["opcode"] == 0x39
     assert "<ExtraXmlCommand>OK</ExtraXmlCommand>" in dec_39["xml"]
+
+
+def test_format_win32_error():
+    """Verify Win32 error code formatting."""
+    from openeasysync.protocol.replies import format_win32_error
+
+    assert format_win32_error(0) == "The operation completed successfully."
+    assert format_win32_error(2) == "The system cannot find the file specified."
+    assert format_win32_error(3) == "The system cannot find the path specified."
+    assert format_win32_error(5) == "Access is denied."
+    assert format_win32_error(21) == "The device is not ready."
+    assert format_win32_error(999999) == "Win32 error 999999"
