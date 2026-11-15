@@ -33,6 +33,7 @@ from openeasysync.constants import (
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
+    REPLY_DOWNLOAD_CHUNK,
     REPLY_DOWNLOAD_SINGLE,
     REPLY_LISTING,
     REPLY_PRECHECK_BATCH,
@@ -40,7 +41,9 @@ from openeasysync.constants import (
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
     STATUS_ERROR,
+    STATUS_INLINE_SMALL_FILE,
     STATUS_OK,
+    STATUS_ZERO_LENGTH,
 )
 from openeasysync.protocol.commands import (
     BatchPrecheckExtRecord,
@@ -408,8 +411,8 @@ def test_upload_protocol_wire_framing_and_server(tmp_path):
     assert len(replies_zero) == 1
     assert len(replies_zero[0]) == 24
     assert replies_zero[0][0] == 0xA1
-    # Unpack status (uint32_le at offset +0x05)
-    status = struct.unpack_from("<I", replies_zero[0], 5)[0]
+    # Unpack status (uint8 at offset +0x02)
+    status = replies_zero[0][2]
     assert status == 7
     assert (tmp_path / "empty.txt").exists()
 
@@ -417,13 +420,13 @@ def test_upload_protocol_wire_framing_and_server(tmp_path):
     cmd_conflict = encode_upload_single("C:\\empty.txt", file_size=10, req_id=11, overwrite=False)
     replies_conflict = handler.handle_command(cmd_conflict)
     assert len(replies_conflict) == 1
-    assert struct.unpack_from("<I", replies_conflict[0], 5)[0] == 2
+    assert replies_conflict[0][2] == 2
 
     # 3. 0x0A with overwrite=True -> succeeds status=0
     cmd_ow = encode_upload_single("C:\\file.txt", file_size=11, req_id=12, overwrite=True)
     replies_ow = handler.handle_command(cmd_ow)
     assert len(replies_ow) == 1
-    assert struct.unpack_from("<I", replies_ow[0], 5)[0] == 0
+    assert replies_ow[0][2] == 0
 
     # 4. Stream 0x0C chunk -> returns 9-byte 0xA5 ACK
     chunk_data = b"Hello World"
@@ -442,3 +445,88 @@ def test_upload_protocol_wire_framing_and_server(tmp_path):
     replies_fin = handler.handle_command(cmd_fin)
     assert replies_fin == []
     assert (tmp_path / "file.txt").read_bytes() == b"Hello World"
+
+
+def test_download_protocol_wire_framing_and_server(tmp_path):
+    """Verify single file download wire framing (0x0B), buffer limits, and server handling."""
+    mapper = PathMapper(virtual_root=str(tmp_path))
+    handler = PeerServerHandler(path_mapper=mapper)
+
+    # 1. Wire Framing and Buffer Overflow validation
+    with pytest.raises(ValueError, match="Source path exceeds 1024-byte"):
+        encode_download_single("C:\\" + "a" * 600)
+
+    with pytest.raises(ValueError, match="Destination path exceeds 1024-byte"):
+        encode_download_single("C:\\file.txt", local_path="D:\\" + "b" * 600)
+
+    cmd_pkt = encode_download_single("C:\\src.bin", local_path="D:\\dest.bin", req_id=42)
+    assert cmd_pkt[0] == OP_DOWNLOAD_SINGLE
+    req_id, src_len = struct.unpack_from("<IH", cmd_pkt, 1)
+    assert req_id == 42
+    assert src_len == len("C:\\src.bin".encode("utf-16le"))
+    dest_len = struct.unpack_from("<H", cmd_pkt, 7 + src_len)[0]
+    assert dest_len == len("D:\\dest.bin".encode("utf-16le"))
+
+    # When local_path omitted, dest_len MUST still be present as 0x0000 (2 bytes)
+    cmd_no_dest = encode_download_single("C:\\src.bin", req_id=43)
+    assert len(cmd_no_dest) == 9 + len("C:\\src.bin".encode("utf-16le"))
+    assert struct.unpack_from("<H", cmd_no_dest, len(cmd_no_dest) - 2)[0] == 0
+
+    # 2. Server response for missing file -> status=1 (STATUS_ERROR), win32_error=2
+    cmd_missing = encode_download_single("C:\\nonexistent.txt", req_id=100)
+    reps_missing = handler.handle_command(cmd_missing)
+    assert len(reps_missing) == 1
+    rep_missing = decode_reply(reps_missing[0])
+    assert rep_missing["opcode"] == REPLY_STATUS_ACK
+    assert rep_missing["status"] == STATUS_ERROR
+    assert rep_missing["win32_error"] == 2
+    assert rep_missing["req_id"] == 100
+
+    # 3. Server response for 0-byte file -> status=7 (STATUS_ZERO_LENGTH)
+    empty_file = tmp_path / "empty.dat"
+    empty_file.write_bytes(b"")
+    cmd_empty = encode_download_single("C:\\empty.dat", req_id=101)
+    reps_empty = handler.handle_command(cmd_empty)
+    assert len(reps_empty) == 1
+    rep_empty = decode_reply(reps_empty[0])
+    assert rep_empty["opcode"] == REPLY_STATUS_ACK
+    assert rep_empty["status"] == STATUS_ZERO_LENGTH
+    assert rep_empty["req_id"] == 101
+
+    # 4. Server response for small file (<= 64,512 bytes) -> inline status=9
+    small_content = b"Small file inline payload content!" * 10
+    small_file = tmp_path / "small.txt"
+    small_file.write_bytes(small_content)
+    cmd_small = encode_download_single("C:\\small.txt", req_id=102)
+    reps_small = handler.handle_command(cmd_small)
+    assert len(reps_small) == 1
+    assert len(reps_small[0]) == 24 + len(small_content)
+    rep_small = decode_reply(reps_small[0])
+    assert rep_small["opcode"] == REPLY_STATUS_ACK
+    assert rep_small["status"] == STATUS_INLINE_SMALL_FILE
+    assert rep_small["req_id"] == 102
+    assert rep_small["data_len"] == len(small_content)
+    assert rep_small["file_data"] == small_content
+
+    # 5. Server response for large file (> 64,512 bytes) -> initial 0xA1 (status=0) + streaming 0xA3 chunks
+    large_content = b"ABCDEF0123456789" * 5000  # 80,000 bytes
+    large_file = tmp_path / "large.bin"
+    large_file.write_bytes(large_content)
+    cmd_large = encode_download_single("C:\\large.bin", req_id=103)
+    reps_large = handler.handle_command(cmd_large)
+    assert len(reps_large) >= 2
+    # First packet: initial 24-byte ACK
+    rep_init = decode_reply(reps_large[0])
+    assert rep_init["opcode"] == REPLY_STATUS_ACK
+    assert rep_init["status"] == STATUS_OK
+    assert rep_init["file_size"] == 80000
+    assert rep_init["req_id"] == 103
+
+    # Subsequent packets: 0xA3 data chunks
+    assembled_bytes = bytearray()
+    for chunk_pkt in reps_large[1:]:
+        assert chunk_pkt[0] == REPLY_DOWNLOAD_CHUNK
+        rep_chunk = decode_reply(chunk_pkt)
+        assert rep_chunk["item_id"] == 103
+        assembled_bytes.extend(rep_chunk["data"])
+    assert bytes(assembled_bytes) == large_content

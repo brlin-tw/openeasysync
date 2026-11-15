@@ -250,3 +250,53 @@ def test_e2e_single_file_upload_conflict(dual_host_setup):
     success = transfer_a.upload_file(str(src), "C:\\conflict.txt", overwrite=True)
     assert success is True
     assert existing_b.read_text() == "New content from A"
+
+
+def test_e2e_download_small_file_inline(dual_host_setup):
+    """Verify single file download of a small file (<= 64,512 bytes) using inline delivery (status=9)."""
+    dir_a = dual_host_setup["dir_a"]
+    dir_b = dual_host_setup["dir_b"]
+    transfer_a = dual_host_setup["transfer_a"]
+
+    small_b = dir_b / "small_inline.txt"
+    content = b"Inline small payload test string!" * 50
+    small_b.write_bytes(content)
+
+    dest_a = dir_a / "downloaded_inline.txt"
+    progress_calls: list[tuple[int, int]] = []
+    success = transfer_a.download_file(
+        "C:\\small_inline.txt",
+        str(dest_a),
+        progress_callback=lambda cur, tot: progress_calls.append((cur, tot)),
+    )
+    assert success is True
+    assert dest_a.exists()
+    assert dest_a.read_bytes() == content
+    assert progress_calls == [(len(content), len(content))]
+
+
+def test_e2e_download_zero_length(dual_host_setup):
+    """Verify single file download of a 0-byte file completing immediately (status=7)."""
+    dir_a = dual_host_setup["dir_a"]
+    dir_b = dual_host_setup["dir_b"]
+    transfer_a = dual_host_setup["transfer_a"]
+
+    empty_b = dir_b / "empty_remote.bin"
+    empty_b.write_bytes(b"")
+
+    dest_a = dir_a / "downloaded_empty.bin"
+    success = transfer_a.download_file("C:\\empty_remote.bin", str(dest_a))
+    assert success is True
+    assert dest_a.exists()
+    assert dest_a.stat().st_size == 0
+
+
+def test_e2e_download_missing_file_raises_filenotfound(dual_host_setup):
+    """Verify download of nonexistent file on peer raises FileNotFoundError with Win32 error."""
+    dir_a = dual_host_setup["dir_a"]
+    transfer_a = dual_host_setup["transfer_a"]
+
+    dest_a = dir_a / "should_not_exist.bin"
+    with pytest.raises(FileNotFoundError, match="Download failed on peer with Win32 error 2"):
+        transfer_a.download_file("C:\\does_not_exist.dat", str(dest_a))
+    assert not dest_a.exists()

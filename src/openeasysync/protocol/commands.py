@@ -225,10 +225,40 @@ def encode_cancel_keep_partial(item_id: int = 1, status: int = 0) -> bytes:
     return struct.pack("<BII", OP_CANCEL_KEEP_PARTIAL, item_id & 0xFFFFFFFF, status & 0xFFFFFFFF)
 
 
-def encode_download_single(src_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x0B: Single File Download Request."""
-    path_b = src_path.encode(encoding, errors="replace")
-    return bytes([OP_DOWNLOAD_SINGLE]) + struct.pack("<I", len(path_b)) + path_b
+def encode_download_single(
+    remote_path: str = "",
+    local_path: str = "",
+    req_id: int = 1,
+    *,
+    src_path: str = "",
+    dest_path: str = "",
+) -> bytes:
+    """Opcode 0x0B: Single File Download Request (Section 4.2.5).
+
+    Framing: [0x0B][req_id:u32_le][src_path_len:u16_le][src_path:wchar_t][dest_path_len:u16_le][dest_path:wchar_t]
+    Base header and lengths comprise exactly 9 bytes.
+    src_path: UTF-16LE without null terminator (max 1024 bytes).
+    dest_path: optional client dest path, UTF-16LE without null terminator (max 1024 bytes).
+    dest_path_len (uint16_le) MUST be present (0x0000 if omitted).
+    """
+    effective_src = remote_path or src_path
+    effective_dest = local_path or dest_path
+
+    src_path_bytes = effective_src.encode("utf-16le")
+    if len(src_path_bytes) > 1024:
+        raise ValueError("Source path exceeds 1024-byte EasySuite stack buffer limit")
+
+    dest_path_bytes = effective_dest.encode("utf-16le") if effective_dest else b""
+    if len(dest_path_bytes) > 1024:
+        raise ValueError("Destination path exceeds 1024-byte EasySuite stack buffer limit")
+
+    header = struct.pack(
+        "<BIH",
+        OP_DOWNLOAD_SINGLE,
+        req_id & 0xFFFFFFFF,
+        len(src_path_bytes),
+    )
+    return header + src_path_bytes + struct.pack("<H", len(dest_path_bytes)) + dest_path_bytes
 
 
 def encode_download_batch(paths: list[str], encoding: str = "utf-8") -> bytes:
@@ -371,11 +401,37 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         OP_REMOVE_DIR,
         OP_DELETE_DIR,
         OP_CREATE_DIR,
-        OP_DOWNLOAD_SINGLE,
     ):
         path_len = struct.unpack_from("<I", payload, 1)[0]
         path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
         return {"opcode": opcode, "path": path_str}
+
+    if opcode == OP_DOWNLOAD_SINGLE:
+        if len(payload) >= 7:
+            req_id, src_len = struct.unpack_from("<IH", payload, 1)
+            src_path = payload[7 : 7 + src_len].decode("utf-16le", errors="replace")
+            dest_path = ""
+            if len(payload) >= 7 + src_len + 2:
+                dest_len = struct.unpack_from("<H", payload, 7 + src_len)[0]
+                dest_path = payload[9 + src_len : 9 + src_len + dest_len].decode(
+                    "utf-16le", errors="replace"
+                )
+            return {
+                "opcode": OP_DOWNLOAD_SINGLE,
+                "req_id": req_id,
+                "path": src_path,
+                "src_path": src_path,
+                "dest_path": dest_path,
+            }
+        path_len = struct.unpack_from("<I", payload, 1)[0]
+        path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
+        return {
+            "opcode": OP_DOWNLOAD_SINGLE,
+            "req_id": 1,
+            "path": path_str,
+            "src_path": path_str,
+            "dest_path": "",
+        }
 
     if opcode == OP_QUERY_SPACE:
         if len(payload) >= 7 and struct.calcsize("<IH") == 6:

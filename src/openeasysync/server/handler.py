@@ -39,7 +39,9 @@ from openeasysync.constants import (
     STATUS_ACTIVE_DIR_ACK,
     STATUS_CONFLICT,
     STATUS_DISK_FULL,
+    STATUS_ERROR,
     STATUS_EXISTS,
+    STATUS_INLINE_SMALL_FILE,
     STATUS_MAC_MODE_ACK,
     STATUS_OK,
     STATUS_UPLOAD_BATCH_DONE,
@@ -64,7 +66,7 @@ from openeasysync.protocol.replies import (
     encode_download_batch_done,
     encode_download_batch_empty,
     encode_download_batch_stream,
-    encode_download_single_reply,
+    encode_download_chunk,
     encode_error_code,
     encode_listing_reply,
     encode_precheck_batch_ext_reply,
@@ -138,7 +140,7 @@ class PeerServerHandler:
             return [self._handle_precheck_single(cmd.get("path", ""))]
 
         if opcode == OP_DOWNLOAD_SINGLE:
-            return [self._handle_download_single(cmd["path"])]
+            return self._handle_download_single(cmd)
 
         if opcode == OP_DOWNLOAD_BATCH:
             return self._handle_download_batch(cmd["paths"])
@@ -438,29 +440,97 @@ class PeerServerHandler:
                 pass
         return []
 
-    def _handle_download_single(self, src_path: str) -> bytes:
+    def _handle_download_single(self, cmd: dict[str, Any] | str) -> list[bytes]:
+        req_id = 1
+        if isinstance(cmd, dict):
+            src_path = cmd.get("path") or cmd.get("src_path", "")
+            req_id = cmd.get("req_id", 1)
+        else:
+            src_path = str(cmd)
+
         local_src = self.mapper.wire_to_local(src_path)
         try:
             if not os.path.isfile(local_src):
-                return encode_error_code(2)  # ERROR_FILE_NOT_FOUND
+                return [
+                    encode_status_ack(
+                        status=STATUS_ERROR,
+                        req_opcode=OP_DOWNLOAD_SINGLE,
+                        req_id=req_id,
+                        win32_error=2,  # ERROR_FILE_NOT_FOUND
+                    )
+                ]
 
             stat = os.stat(local_src)
-            with open(local_src, "rb") as f:
-                data = f.read()
+            file_size = stat.st_size
 
-            fd = Win32FindData(
-                file_attributes=128,  # NORMAL
-                creation_time=unix_to_filetime(stat.st_ctime),
-                last_access_time=unix_to_filetime(stat.st_atime),
-                last_write_time=unix_to_filetime(stat.st_mtime),
-                file_size=stat.st_size,
-                filename=os.path.basename(local_src),
+            # Mode 1: Zero-Length File
+            if file_size == 0:
+                return [
+                    encode_status_ack(
+                        status=STATUS_ZERO_LENGTH,
+                        req_opcode=OP_DOWNLOAD_SINGLE,
+                        req_id=req_id,
+                        file_size=0,
+                    )
+                ]
+
+            # Mode 2: Small File (<= 64,512 bytes) inline delivery
+            if file_size <= 64512:
+                with open(local_src, "rb") as f:
+                    file_data = f.read()
+                return [
+                    encode_status_ack(
+                        status=STATUS_INLINE_SMALL_FILE,
+                        req_opcode=OP_DOWNLOAD_SINGLE,
+                        req_id=req_id,
+                        file_size=file_size,
+                        flags=2,
+                        file_data=file_data,
+                    )
+                ]
+
+            # Mode 3: Large File (> 64,512 bytes) streaming chunks
+            initial_ack = encode_status_ack(
+                status=STATUS_OK,
+                req_opcode=OP_DOWNLOAD_SINGLE,
+                req_id=req_id,
+                file_size=file_size,
             )
-            return encode_download_single_reply(fd, data)
+            replies = [initial_ack]
+
+            chunk_size = 64000
+            total_chunks = (file_size + chunk_size - 1) // chunk_size
+            with open(local_src, "rb") as f:
+                for chunk_idx in range(total_chunks):
+                    chunk_data = f.read(chunk_size)
+                    replies.append(
+                        encode_download_chunk(
+                            item_id=req_id,
+                            chunk_index=chunk_idx,
+                            total_chunks=total_chunks,
+                            chunk_data=chunk_data,
+                        )
+                    )
+            return replies
+
         except PermissionError:
-            return encode_error_code(5)
+            return [
+                encode_status_ack(
+                    status=STATUS_ERROR,
+                    req_opcode=OP_DOWNLOAD_SINGLE,
+                    req_id=req_id,
+                    win32_error=5,  # ERROR_ACCESS_DENIED
+                )
+            ]
         except Exception:
-            return encode_error_code(2)
+            return [
+                encode_status_ack(
+                    status=STATUS_ERROR,
+                    req_opcode=OP_DOWNLOAD_SINGLE,
+                    req_id=req_id,
+                    win32_error=2,
+                )
+            ]
 
     def _handle_upload_batch(self, base_dir: str, records: list[Any]) -> bytes:
         local_base = self.mapper.wire_to_local(base_dir)

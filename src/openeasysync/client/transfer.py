@@ -16,6 +16,7 @@ from openeasysync.constants import (
     REPLY_CHUNK_ACK,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
+    REPLY_DOWNLOAD_CHUNK,
     REPLY_DOWNLOAD_SINGLE,
     REPLY_ERROR_CODE,
     REPLY_LISTING,
@@ -207,9 +208,7 @@ class TransferManager:
                 f"Invalid Opcode 0x0A reply (expected 24-byte 0xA1, got {len(rep_bytes)} bytes)"
             )
 
-        status = struct.unpack_from("<I", rep_bytes, 5)[0]
-        if status == 0 and rep_bytes[2] != 0:
-            status = rep_bytes[2]
+        req_opcode, status, reply_req_id = struct.unpack_from("<BBI", rep_bytes, 1)
 
         if status == 7:
             if progress_callback:
@@ -223,11 +222,7 @@ class TransferManager:
             raise OSError(f"Remote disk is full: {dest_path_str}")
 
         if status == 1:
-            win32_err = (
-                struct.unpack_from("<I", rep_bytes, 9)[0]
-                if len(rep_bytes) >= 13
-                else struct.unpack_from("<I", rep_bytes, 7)[0]
-            )
+            win32_err = struct.unpack_from("<I", rep_bytes, 7)[0]
             raise OSError(f"Upload failed: {dest_path_str} : {format_win32_error(win32_err)}")
 
         if status != 0:
@@ -331,10 +326,7 @@ class TransferManager:
                 f"Invalid Opcode 0x0A reply (expected 24-byte 0xA1, got {len(rep_bytes)} bytes)"
             )
 
-        # Unpack status (uint32_le at offset +0x05)
-        status = struct.unpack_from("<I", rep_bytes, 5)[0]
-        if status == 0 and rep_bytes[2] != 0:
-            status = rep_bytes[2]
+        req_opcode, status, reply_req_id = struct.unpack_from("<BBI", rep_bytes, 1)
 
         if status == 7:
             # The file was 0 bytes and is already completed
@@ -349,11 +341,7 @@ class TransferManager:
             raise OSError(f"Remote disk is full: {dest_path_str}")
 
         if status == 1:
-            win32_err = (
-                struct.unpack_from("<I", rep_bytes, 9)[0]
-                if len(rep_bytes) >= 13
-                else struct.unpack_from("<I", rep_bytes, 7)[0]
-            )
+            win32_err = struct.unpack_from("<I", rep_bytes, 7)[0]
             raise OSError(f"Upload failed: {dest_path_str} : {format_win32_error(win32_err)}")
 
         if status != 0:
@@ -410,38 +398,109 @@ class TransferManager:
         local_dest_path: str,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> bool:
-        """Downloads a single file from remote peer (Opcode 0x0A)."""
-        cmd = encode_download_single(remote_src_path)
-        rep_bytes = self.session.send_command(cmd)
-        rep = decode_reply(rep_bytes)
+        """Downloads a single file from remote peer (Opcode 0x0B)."""
+        req_id = self._get_next_item_id()
 
-        if rep["opcode"] == REPLY_STATUS_ACK and rep.get("status") == STATUS_ERROR:
-            win32_err = rep.get("win32_error", 0)
-            raise OSError(f"Download failed: {remote_src_path} : {format_win32_error(win32_err)}")
+        # 1. Pack Opcode 0x0B Wire Framing
+        cmd_packet = encode_download_single(
+            remote_path=remote_src_path,
+            local_path=local_dest_path,
+            req_id=req_id,
+        )
 
-        if rep["opcode"] == REPLY_ERROR_CODE:
-            win32_err = rep.get("win32_error", 0)
-            raise OSError(f"Download failed: {remote_src_path} : {format_win32_error(win32_err)}")
+        parent = os.path.dirname(local_dest_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
 
-        if rep["opcode"] == REPLY_DOWNLOAD_SINGLE:
-            parent = os.path.dirname(local_dest_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
+        self.session.drain_replies()
+        self.session.send_packet(cmd_packet)
 
+        # 2. Handle Server Reply (0xA1 vs. 0xA3)
+        reply = self.session.recv_reply(timeout=10.0)
+        opcode = reply[0]
+
+        if opcode == REPLY_STATUS_ACK:
+            req_opcode, status, reply_req_id = struct.unpack_from("<B B I", reply, 1)
+            if status == 1:
+                win32_err = struct.unpack_from("<I", reply, 7)[0]
+                raise FileNotFoundError(f"Download failed on peer with Win32 error {win32_err}")
+            elif status == 7:
+                # Empty (0-byte) file
+                with open(local_dest_path, "wb") as f:
+                    pass
+                if progress_callback:
+                    progress_callback(0, 0)
+                return True
+            elif status == 9:
+                # Small file inline delivery (<= 64,512 bytes)
+                data_len = struct.unpack_from("<I", reply, 0x14)[0]
+                file_data = reply[0x18 : 0x18 + data_len]
+                with open(local_dest_path, "wb") as f:
+                    f.write(file_data)
+                if progress_callback:
+                    progress_callback(len(file_data), len(file_data))
+                return True
+            elif status == 0:
+                # Large file (> 64,512 bytes): proceed to receive 0xA3 chunks
+                file_size = struct.unpack_from("<Q", reply, 0x0B)[0]
+                self._receive_a3_chunks(local_dest_path, file_size, progress_callback)
+                return True
+            else:
+                raise OSError(f"Download failed with unexpected status {status}: {remote_src_path}")
+
+        elif opcode == REPLY_DOWNLOAD_CHUNK:
+            self._receive_a3_chunks(local_dest_path, 0, progress_callback, initial_chunk=reply)
+            return True
+
+        elif opcode == REPLY_DOWNLOAD_SINGLE:  # legacy 0xA4 fallback
+            rep = decode_reply(reply)
             with open(local_dest_path, "wb") as f:
                 f.write(rep["file_data"])
-
             if progress_callback:
                 progress_callback(len(rep["file_data"]), len(rep["file_data"]))
-
-            # Restore timestamps
-            mtime = filetime_to_unix(rep["find_data"].last_write_time)
-            atime = filetime_to_unix(rep["find_data"].last_access_time)
-            if mtime > 0:
-                os.utime(local_dest_path, (atime if atime > 0 else mtime, mtime))
             return True
 
         return False
+
+    def _receive_a3_chunks(
+        self,
+        local_dest: str,
+        file_size: int,
+        progress_callback: Callable[[int, int], None] | None = None,
+        initial_chunk: bytes | None = None,
+    ) -> None:
+        parent = os.path.dirname(local_dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        bytes_received = 0
+        with open(local_dest, "wb") as f:
+            if initial_chunk is not None:
+                assert initial_chunk[0] == REPLY_DOWNLOAD_CHUNK
+                item_id, chunk_idx, total_chunks, chunk_len = struct.unpack_from(
+                    "<I I I I", initial_chunk, 1
+                )
+                chunk_data = initial_chunk[17 : 17 + chunk_len]
+                f.write(chunk_data)
+                bytes_received += len(chunk_data)
+                if progress_callback:
+                    progress_callback(bytes_received, file_size)
+                if chunk_idx + 1 >= total_chunks:
+                    return
+
+            while True:
+                chunk_pkt = self.session.recv_reply(timeout=15.0)
+                assert chunk_pkt[0] == REPLY_DOWNLOAD_CHUNK
+                item_id, chunk_idx, total_chunks, chunk_len = struct.unpack_from(
+                    "<I I I I", chunk_pkt, 1
+                )
+                chunk_data = chunk_pkt[17 : 17 + chunk_len]
+                f.write(chunk_data)
+                bytes_received += len(chunk_data)
+                if progress_callback:
+                    progress_callback(bytes_received, file_size)
+                if chunk_idx + 1 >= total_chunks:
+                    break
 
     def upload_batch(
         self,

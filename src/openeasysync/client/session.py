@@ -178,6 +178,21 @@ class SessionManager:
             for block in blocks:
                 self.poller.enqueue_tx(block)
 
+    def recv_reply(self, timeout: float = 10.0) -> bytes:
+        """Receives the next Server Reply (0xA1..0xAC) from the reply queue."""
+        try:
+            return self._reply_queue.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(f"Timeout waiting for server reply after {timeout} seconds")
+
+    def drain_replies(self) -> None:
+        """Drains any stale replies remaining in the reply queue."""
+        while not self._reply_queue.empty():
+            try:
+                self._reply_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def send_command(
         self,
         cmd_payload: bytes,

@@ -95,22 +95,36 @@ def encode_status_ack(
     req_opcode: int = 0,
     req_id: int = 0,
     win32_error: int = 0,
+    file_size: int = 0,
+    flags: int = 0,
+    file_data: bytes = b"",
 ) -> bytes:
-    """Opcode 0xA1: Command Status / ACK (24-byte structured response header).
+    """Opcode 0xA1: Command Status / ACK (24-byte structured response header + optional inline data).
 
-    Framing: [0xA1][req_opcode:u8][status:u8][req_id:u16_le][status:u32_le][win32_error:u32_le][reserved:11B]
-    Guarantees status is present at both offset +0x02 (uint8) and offset +0x05 (uint32_le).
+    Framing:
+    [0xA1][req_opcode:u8][status:u8][req_id:u32_le][win32_error:u32_le]
+    [file_size_low:u32_le][file_size_high:u32_le][flags:u8][data_len:u32_le][file_data:bytes]
+    Total header size: 24 bytes (0x18). Total packet size: 24 + len(file_data) bytes.
     """
-    return struct.pack(
-        "<BBBHI I 11s",
+    data_len = len(file_data)
+    effective_file_size = file_size if file_size else data_len
+    file_size_low = effective_file_size & 0xFFFFFFFF
+    file_size_high = (effective_file_size >> 32) & 0xFFFFFFFF
+    effective_flags = flags if flags != 0 else (2 if data_len > 0 else 0)
+
+    header = struct.pack(
+        "<BBBIIIIBI",
         REPLY_STATUS_ACK,
         req_opcode & 0xFF,
         status & 0xFF,
-        req_id & 0xFFFF,
-        status & 0xFFFFFFFF,
+        req_id & 0xFFFFFFFF,
         win32_error & 0xFFFFFFFF,
-        b"\x00" * 11,
+        file_size_low,
+        file_size_high,
+        effective_flags & 0xFF,
+        data_len & 0xFFFFFFFF,
     )
+    return header + file_data
 
 
 def encode_chunk_ack(item_id: int, chunk_index: int) -> bytes:
@@ -281,32 +295,38 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
     opcode = payload[0]
 
     if opcode == REPLY_STATUS_ACK:
-        if len(payload) >= 11:
-            req_op, status_code = payload[1], payload[2]
-            status_offset_5 = (
-                struct.unpack_from("<I", payload, 5)[0] if len(payload) >= 9 else status_code
-            )
-            status = status_offset_5 if status_offset_5 != 0 else status_code
-            win32_err = 0
-            if len(payload) >= 13:
-                win32_err = struct.unpack_from("<I", payload, 9)[0]
-            if win32_err == 0 and len(payload) >= 11:
-                win32_err = struct.unpack_from("<I", payload, 7)[0]
-            req_id = struct.unpack_from("<H", payload, 3)[0]
+        if len(payload) >= 24:
+            req_op, status, req_id = struct.unpack_from("<BBI", payload, 1)
+            win32_err = struct.unpack_from("<I", payload, 7)[0]
+            file_size = struct.unpack_from("<Q", payload, 0x0B)[0]
+            flags = payload[0x13]
+            data_len = struct.unpack_from("<I", payload, 0x14)[0]
+            file_data = payload[0x18 : 0x18 + data_len]
             return {
                 "opcode": REPLY_STATUS_ACK,
                 "req_opcode": req_op,
                 "status": status,
                 "req_id": req_id,
                 "win32_error": win32_err,
+                "file_size": file_size,
+                "flags": flags,
+                "data_len": data_len,
+                "file_data": file_data,
             }
-        status_code = payload[1] if len(payload) > 1 else 0
+        req_op = payload[1] if len(payload) > 1 else 0
+        status_code = payload[2] if len(payload) > 2 else 0
+        req_id = struct.unpack_from("<H", payload, 3)[0] if len(payload) >= 5 else 0
+        win32_err = struct.unpack_from("<I", payload, 7)[0] if len(payload) >= 11 else 0
         return {
             "opcode": REPLY_STATUS_ACK,
-            "req_opcode": 0,
+            "req_opcode": req_op,
             "status": status_code,
-            "req_id": 0,
-            "win32_error": 0,
+            "req_id": req_id,
+            "win32_error": win32_err,
+            "file_size": 0,
+            "flags": 0,
+            "data_len": 0,
+            "file_data": b"",
         }
 
     if opcode == REPLY_LISTING:
