@@ -10,6 +10,7 @@ from openeasysync.constants import (
     OP_DOWNLOAD_BATCH,
     OP_DOWNLOAD_SINGLE,
     OP_LIST_DIR,
+    OP_NOTIFY_ACTIVE_DIR,
     OP_PRECHECK_BATCH,
     OP_PRECHECK_BATCH_EXT,
     OP_PRECHECK_SINGLE,
@@ -45,6 +46,7 @@ from openeasysync.protocol.commands import (
     encode_download_single,
     encode_extended_xml,
     encode_list_dir,
+    encode_notify_active_dir,
     encode_precheck_batch,
     encode_precheck_batch_ext,
     encode_precheck_single,
@@ -99,10 +101,20 @@ def test_command_encoders_and_decoders():
     # Test backwards-compatible 1-byte decode
     assert decode_command(bytes([OP_QUERY_ROOT]))["opcode"] == OP_QUERY_ROOT
 
-    # 0x02 Verify Peer Name
-    c02 = decode_command(encode_verify_peer_name("MYCOMPUTER"))
-    assert c02["opcode"] == OP_VERIFY_PEER_NAME
-    assert c02["computer_name"] == "MYCOMPUTER"
+    # 0x02 Notify Active Directory (and backward-compatible verify peer name)
+    encoded_02 = encode_notify_active_dir("C:\\Users\\Guest")
+    assert (
+        encoded_02 == bytes([OP_NOTIFY_ACTIVE_DIR, len("C:\\Users\\Guest")]) + b"C:\\Users\\Guest"
+    )
+    c02 = decode_command(encoded_02)
+    assert c02["opcode"] == OP_NOTIFY_ACTIVE_DIR
+    assert c02["path"] == "C:\\Users\\Guest"
+    assert c02["computer_name"] == "C:\\Users\\Guest"
+
+    # Backward compatibility alias test
+    c02_alias = decode_command(encode_verify_peer_name("MYCOMPUTER"))
+    assert c02_alias["opcode"] == OP_VERIFY_PEER_NAME
+    assert c02_alias["computer_name"] == "MYCOMPUTER"
 
     # 0x04 List Dir
     c04 = decode_command(encode_list_dir("C:\\Users\\Guest"))

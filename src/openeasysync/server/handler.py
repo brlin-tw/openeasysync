@@ -19,6 +19,7 @@ from openeasysync.constants import (
     OP_EXTENDED_XML_MAX,
     OP_EXTENDED_XML_MIN,
     OP_LIST_DIR,
+    OP_NOTIFY_ACTIVE_DIR,
     OP_PRECHECK_BATCH,
     OP_PRECHECK_BATCH_EXT,
     OP_PRECHECK_SINGLE,
@@ -31,6 +32,7 @@ from openeasysync.constants import (
     OP_VERIFY_PEER_NAME,
     OP_VNIC_SWITCH,
     OP_XML_CONTROL,
+    STATUS_ACTIVE_DIR_ACK,
     STATUS_EXISTS,
     STATUS_MAC_MODE_ACK,
     STATUS_OK,
@@ -71,6 +73,7 @@ class PeerServerHandler:
     def __init__(self, path_mapper: PathMapper | None = None):
         self.mapper = path_mapper or PathMapper()
         self.is_cancelled = False
+        self.peer_active_dir = ""
 
     def handle_command(self, payload: bytes) -> list[bytes]:
         """Dispatches a command payload and returns a list of reply payload(s)."""
@@ -83,8 +86,9 @@ class PeerServerHandler:
         if opcode == OP_QUERY_ROOT:
             return [self._handle_query_root()]
 
-        if opcode == OP_VERIFY_PEER_NAME:
-            return [encode_status_ack(STATUS_OK)]
+        if opcode in (OP_NOTIFY_ACTIVE_DIR, OP_VERIFY_PEER_NAME):
+            self.peer_active_dir = cmd.get("path", "")
+            return [encode_status_ack(STATUS_ACTIVE_DIR_ACK)]
 
         if opcode == OP_LIST_DIR:
             return [self._handle_list_dir(cmd["path"])]

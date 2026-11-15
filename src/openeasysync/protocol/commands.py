@@ -17,6 +17,7 @@ from openeasysync.constants import (
     OP_EXTENDED_XML_MIN,
     OP_EXTRA_XML,
     OP_LIST_DIR,
+    OP_NOTIFY_ACTIVE_DIR,
     OP_PLUGIN_RPC,
     OP_PRECHECK_BATCH,
     OP_PRECHECK_BATCH_EXT,
@@ -64,10 +65,21 @@ def encode_query_root(path: str = "\\") -> bytes:
     return bytes([OP_QUERY_ROOT, 0x00, 0x00, 0x00, len(path_bytes)]) + path_bytes
 
 
+def encode_notify_active_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
+    """Opcode 0x02: Notify / Set Active Remote Directory.
+
+    EasySuite.exe wire format (0x0040da90 / 0x0043d577):
+    [0x02][path_len:u8][dir_path:bytes]
+    """
+    path_bytes = dir_path.encode(encoding, errors="replace")
+    if len(path_bytes) > 255:
+        path_bytes = path_bytes[:255]
+    return bytes([OP_NOTIFY_ACTIVE_DIR, len(path_bytes)]) + path_bytes
+
+
 def encode_verify_peer_name(computer_name: str, encoding: str = "ascii") -> bytes:
-    """Opcode 0x02: Verify Peer Computer Name."""
-    name_b = computer_name.encode(encoding, errors="replace")
-    return bytes([OP_VERIFY_PEER_NAME, len(name_b)]) + name_b
+    """Opcode 0x02 alias for backward compatibility."""
+    return encode_notify_active_dir(computer_name, encoding=encoding)
 
 
 def encode_list_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
@@ -241,10 +253,10 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             path = payload[5 : 5 + path_len].decode(encoding, errors="replace")
         return {"opcode": OP_QUERY_ROOT, "path": path}
 
-    if opcode == OP_VERIFY_PEER_NAME:
-        name_len = payload[1] if len(payload) > 1 else 0
-        name = payload[2 : 2 + name_len].decode(encoding, errors="replace")
-        return {"opcode": opcode, "computer_name": name}
+    if opcode in (OP_NOTIFY_ACTIVE_DIR, OP_VERIFY_PEER_NAME):
+        path_len = payload[1] if len(payload) > 1 else 0
+        path_str = payload[2 : 2 + path_len].decode(encoding, errors="replace")
+        return {"opcode": opcode, "path": path_str, "computer_name": path_str}
 
     if opcode == OP_LIST_DIR:
         path_len = struct.unpack_from("<H", payload, 1)[0]

@@ -84,6 +84,10 @@ def test_e2e_query_roots_and_list_dir(dual_host_setup):
     sub_names = [e.find_data.filename for e in sub_entries]
     assert "nested.dat" in sub_names
 
+    # 4. Notify active directory
+    assert transfer_a.notify_active_dir("C:\\subfolder") is True
+    assert dual_host_setup["session_b"].server_handler.peer_active_dir == "C:\\subfolder"
+
 
 def test_e2e_single_file_upload_and_download(dual_host_setup):
     """Verify single file upload (A -> B) and download (B -> A) with checksum verification."""

@@ -17,6 +17,7 @@ from openeasysync.constants import (
     REPLY_PRECHECK_BATCH_EXT,
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
+    STATUS_ACTIVE_DIR_ACK,
     STATUS_EXISTS,
     STATUS_OK,
     STATUS_UPLOAD_SINGLE_DONE,
@@ -31,6 +32,7 @@ from openeasysync.protocol.commands import (
     encode_download_batch,
     encode_download_single,
     encode_list_dir,
+    encode_notify_active_dir,
     encode_precheck_batch_ext,
     encode_precheck_single,
     encode_query_root,
@@ -81,8 +83,15 @@ class TransferManager:
             raise OSError(f"Remote error querying roots: {rep['win32_error']}")
         return []
 
+    def notify_active_dir(self, remote_path: str) -> bool:
+        """Notifies remote peer of active local directory (Opcode 0x02)."""
+        cmd = encode_notify_active_dir(remote_path)
+        rep_bytes = self.session.send_command(cmd)
+        rep = decode_reply(rep_bytes)
+        return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_ACTIVE_DIR_ACK
+
     def list_dir(self, remote_path: str) -> list[Entry552]:
-        """Lists directory contents on remote peer (Opcode 0x02)."""
+        """Lists directory contents on remote peer (Opcode 0x04)."""
         cmd = encode_list_dir(remote_path)
         rep_bytes = self.session.send_command(cmd)
         rep = decode_reply(rep_bytes)
@@ -93,28 +102,28 @@ class TransferManager:
         return []
 
     def create_dir(self, remote_path: str) -> bool:
-        """Creates a directory on remote peer (Opcode 0x06)."""
+        """Creates a directory on remote peer (Opcode 0x07)."""
         cmd = encode_create_dir(remote_path)
         rep_bytes = self.session.send_command(cmd)
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
 
     def delete_file(self, remote_path: str) -> bool:
-        """Deletes a file on remote peer (Opcode 0x03)."""
+        """Deletes a file on remote peer (Opcode 0x08)."""
         cmd = encode_delete_file(remote_path)
         rep_bytes = self.session.send_command(cmd)
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
 
     def delete_dir(self, remote_path: str) -> bool:
-        """Recursively deletes a directory on remote peer (Opcode 0x04)."""
+        """Recursively deletes a directory on remote peer (Opcode 0x06)."""
         cmd = encode_delete_dir(remote_path)
         rep_bytes = self.session.send_command(cmd)
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
 
     def rename_file(self, old_path: str, new_path: str) -> bool:
-        """Renames a file on remote peer (Opcode 0x07)."""
+        """Renames a file on remote peer (Opcode 0x09)."""
         cmd = encode_rename_file(old_path, new_path)
         rep_bytes = self.session.send_command(cmd)
         rep = decode_reply(rep_bytes)
