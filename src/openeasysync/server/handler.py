@@ -10,6 +10,8 @@ from typing import Any
 from openeasysync.constants import (
     DRIVE_FIXED,
     DRIVE_REMOVABLE,
+    OP_ABORT_UPLOAD,
+    OP_CANCEL_KEEP_PARTIAL,
     OP_CANCEL_TRANSFER,
     OP_CREATE_DIR,
     OP_DELETE_DIR,
@@ -18,6 +20,7 @@ from openeasysync.constants import (
     OP_DOWNLOAD_SINGLE,
     OP_EXTENDED_XML_MAX,
     OP_EXTENDED_XML_MIN,
+    OP_FILE_CHUNK,
     OP_LIST_DIR,
     OP_NOTIFY_ACTIVE_DIR,
     OP_PRECHECK_BATCH,
@@ -28,16 +31,20 @@ from openeasysync.constants import (
     OP_RENAME_DIR,
     OP_RENAME_FILE,
     OP_SET_MAC_MODE,
+    OP_TRANSFER_COMPLETE,
     OP_UPLOAD_SINGLE,
     OP_VERIFY_PEER_NAME,
     OP_VNIC_SWITCH,
     OP_XML_CONTROL,
     STATUS_ACTIVE_DIR_ACK,
+    STATUS_CONFLICT,
+    STATUS_DISK_FULL,
     STATUS_EXISTS,
     STATUS_MAC_MODE_ACK,
     STATUS_OK,
     STATUS_UPLOAD_BATCH_DONE,
     STATUS_UPLOAD_SINGLE_DONE,
+    STATUS_ZERO_LENGTH,
 )
 from openeasysync.protocol.commands import decode_command, encode_extended_xml
 from openeasysync.protocol.directory_entry import (
@@ -53,6 +60,7 @@ from openeasysync.protocol.replies import (
     BatchDownloadEmptyRecord,
     BatchDownloadStreamRecord,
     BatchPrecheckExtConflict,
+    encode_chunk_ack,
     encode_download_batch_done,
     encode_download_batch_empty,
     encode_download_batch_stream,
@@ -75,6 +83,7 @@ class PeerServerHandler:
         self.mapper = path_mapper or PathMapper()
         self.is_cancelled = False
         self.peer_active_dir = ""
+        self._active_uploads: dict[int, dict[str, Any]] = {}
 
     def handle_command(self, payload: bytes) -> list[bytes]:
         """Dispatches a command payload and returns a list of reply payload(s)."""
@@ -109,9 +118,24 @@ class PeerServerHandler:
             return [self._handle_rename(cmd["old_path"], cmd["new_path"])]
 
         if opcode == OP_UPLOAD_SINGLE:
-            return [
-                self._handle_upload_single(cmd["dest_path"], cmd["find_data"], cmd["file_data"])
-            ]
+            return self._handle_upload_single(cmd)
+
+        if opcode == OP_FILE_CHUNK:
+            return self._handle_file_chunk(cmd)
+
+        if opcode == OP_TRANSFER_COMPLETE:
+            return self._handle_transfer_complete(cmd)
+
+        if opcode in (OP_ABORT_UPLOAD, OP_CANCEL_TRANSFER):
+            if "item_id" in cmd and len(payload) == 9:
+                return self._handle_abort_upload(cmd)
+            self.is_cancelled = True
+            return [encode_status_ack(STATUS_OK)]
+
+        if opcode in (OP_CANCEL_KEEP_PARTIAL, OP_PRECHECK_SINGLE):
+            if "item_id" in cmd and len(payload) == 9:
+                return self._handle_cancel_keep_partial(cmd)
+            return [self._handle_precheck_single(cmd.get("path", ""))]
 
         if opcode == OP_DOWNLOAD_SINGLE:
             return [self._handle_download_single(cmd["path"])]
@@ -119,15 +143,8 @@ class PeerServerHandler:
         if opcode == OP_DOWNLOAD_BATCH:
             return self._handle_download_batch(cmd["paths"])
 
-        if opcode == OP_CANCEL_TRANSFER:
-            self.is_cancelled = True
-            return [encode_status_ack(STATUS_OK)]
-
         if opcode == OP_QUERY_SPACE:
             return [self._handle_query_space(cmd["path"])]
-
-        if opcode == OP_PRECHECK_SINGLE:
-            return [self._handle_precheck_single(cmd["path"])]
 
         if opcode == OP_SET_MAC_MODE:
             return [encode_status_ack(STATUS_MAC_MODE_ACK)]
@@ -255,29 +272,171 @@ class PeerServerHandler:
         except Exception:
             return encode_error_code(3)
 
-    def _handle_upload_single(
-        self, dest_path: str, find_data: Win32FindData, file_data: bytes
-    ) -> bytes:
+    def _handle_upload_single(self, cmd: dict[str, Any]) -> list[bytes]:
+        dest_path = cmd["dest_path"]
+        file_size = cmd.get("file_size", 0)
+        req_id = cmd.get("req_id", 1)
+        overwrite = cmd.get("overwrite", False)
+
+        # Legacy backward compatibility if full payload was bundled
+        if "file_data" in cmd and cmd["file_data"]:
+            file_data = cmd["file_data"]
+            find_data = cmd.get("find_data")
+            local_dest = self.mapper.wire_to_local(dest_path)
+            try:
+                parent_dir = os.path.dirname(local_dest)
+                if parent_dir:
+                    os.makedirs(parent_dir, exist_ok=True)
+                with open(local_dest, "wb") as f:
+                    f.write(file_data)
+                if find_data:
+                    mtime = filetime_to_unix(find_data.last_write_time)
+                    atime = filetime_to_unix(find_data.last_access_time)
+                    if mtime > 0:
+                        os.utime(local_dest, (atime if atime > 0 else mtime, mtime))
+                return [
+                    encode_status_ack(
+                        STATUS_UPLOAD_SINGLE_DONE, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id
+                    )
+                ]
+            except PermissionError:
+                return [
+                    encode_status_ack(
+                        status=1, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id, win32_error=5
+                    )
+                ]
+            except Exception:
+                return [
+                    encode_status_ack(
+                        status=1, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id, win32_error=112
+                    )
+                ]
+
         local_dest = self.mapper.wire_to_local(dest_path)
+
+        # 1. Inspect destination file state (Section 4.2.4 item 3)
+        if os.path.exists(local_dest) and not overwrite:
+            return [
+                encode_status_ack(
+                    status=STATUS_CONFLICT, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id
+                )
+            ]
+
+        # 2. Check disk free space (Section 4.2.4 item 4)
+        try:
+            parent_dir = os.path.dirname(local_dest) or "."
+            os.makedirs(parent_dir, exist_ok=True)
+            free_bytes = shutil.disk_usage(parent_dir).free
+            if free_bytes < file_size:
+                return [
+                    encode_status_ack(
+                        status=STATUS_DISK_FULL, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id
+                    )
+                ]
+        except Exception:
+            pass
+
+        # 3. If file_size == 0 (zero-length file) (Section 4.2.4 item 5)
+        if file_size == 0:
+            try:
+                with open(local_dest, "wb"):
+                    pass
+                return [
+                    encode_status_ack(
+                        status=STATUS_ZERO_LENGTH, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id
+                    )
+                ]
+            except PermissionError:
+                return [
+                    encode_status_ack(
+                        status=1, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id, win32_error=5
+                    )
+                ]
+            except Exception:
+                return [
+                    encode_status_ack(
+                        status=1, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id, win32_error=3
+                    )
+                ]
+
+        # 4. If file_size > 0 (Section 4.2.4 item 6)
         try:
             parent_dir = os.path.dirname(local_dest)
             if parent_dir:
                 os.makedirs(parent_dir, exist_ok=True)
-
-            with open(local_dest, "wb") as f:
-                f.write(file_data)
-
-            # Restore timestamps
-            mtime = filetime_to_unix(find_data.last_write_time)
-            atime = filetime_to_unix(find_data.last_access_time)
-            if mtime > 0:
-                os.utime(local_dest, (atime if atime > 0 else mtime, mtime))
-
-            return encode_status_ack(STATUS_UPLOAD_SINGLE_DONE)
+            f = open(local_dest, "wb")
+            item_id = req_id
+            self._active_uploads[item_id] = {
+                "file": f,
+                "path": local_dest,
+                "total_bytes": file_size,
+                "written_bytes": 0,
+            }
+            return [encode_status_ack(status=STATUS_OK, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id)]
         except PermissionError:
-            return encode_error_code(5)
+            return [
+                encode_status_ack(
+                    status=1, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id, win32_error=5
+                )
+            ]
         except Exception:
-            return encode_error_code(112)  # ERROR_DISK_FULL or generic error
+            return [
+                encode_status_ack(
+                    status=1, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id, win32_error=3
+                )
+            ]
+
+    def _handle_file_chunk(self, cmd: dict[str, Any]) -> list[bytes]:
+        item_id = cmd["item_id"]
+        chunk_index = cmd["chunk_index"]
+        chunk_data = cmd["chunk_data"]
+        upload_ctx = self._active_uploads.get(item_id)
+        if not upload_ctx:
+            return [
+                encode_upload_batch_error(win32_error=6, failed_path="")
+            ]  # ERROR_INVALID_HANDLE
+        try:
+            upload_ctx["file"].write(chunk_data)
+            upload_ctx["file"].flush()
+            upload_ctx["written_bytes"] += len(chunk_data)
+            return [encode_chunk_ack(item_id=item_id, chunk_index=chunk_index)]
+        except Exception:
+            return [
+                encode_upload_batch_error(win32_error=112, failed_path=upload_ctx.get("path", ""))
+            ]
+
+    def _handle_transfer_complete(self, cmd: dict[str, Any]) -> list[bytes]:
+        item_id = cmd.get("item_id", 0)
+        upload_ctx = self._active_uploads.pop(item_id, None)
+        if upload_ctx:
+            try:
+                upload_ctx["file"].flush()
+                upload_ctx["file"].close()
+            except Exception:
+                pass
+        return []
+
+    def _handle_abort_upload(self, cmd: dict[str, Any]) -> list[bytes]:
+        item_id = cmd.get("item_id", 0)
+        upload_ctx = self._active_uploads.pop(item_id, None)
+        if upload_ctx:
+            try:
+                upload_ctx["file"].close()
+                if os.path.exists(upload_ctx["path"]):
+                    os.remove(upload_ctx["path"])
+            except Exception:
+                pass
+        return []
+
+    def _handle_cancel_keep_partial(self, cmd: dict[str, Any]) -> list[bytes]:
+        item_id = cmd.get("item_id", 0)
+        upload_ctx = self._active_uploads.pop(item_id, None)
+        if upload_ctx:
+            try:
+                upload_ctx["file"].close()
+            except Exception:
+                pass
+        return []
 
     def _handle_download_single(self, src_path: str) -> bytes:
         local_src = self.mapper.wire_to_local(src_path)

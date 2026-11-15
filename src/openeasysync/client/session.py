@@ -165,6 +165,19 @@ class SessionManager:
         # 3. Close transport handle
         self.transport.close()
 
+    def send_packet(self, packet: bytes) -> None:
+        """Sends a logical packet asynchronously without awaiting a reply."""
+        with self._lock:
+            blocks = self.splitter.split_message(packet)
+            logger.debug(
+                "Enqueuing one-way packet opcode %#04x (%d bytes across %d blocks)",
+                packet[0],
+                len(packet),
+                len(blocks),
+            )
+            for block in blocks:
+                self.poller.enqueue_tx(block)
+
     def send_command(
         self,
         cmd_payload: bytes,

@@ -3,12 +3,17 @@
 """High-level file transfer engine providing single/batch upload and download APIs."""
 
 import os
+import struct
 from collections.abc import Callable
 
 from openeasysync.client.session import SessionManager
 from openeasysync.constants import (
     ENTRY_KIND_DRIVE,
     FILE_ATTRIBUTE_DIRECTORY,
+    OP_FILE_CHUNK,
+    OP_TRANSFER_COMPLETE,
+    OP_UPLOAD_SINGLE,
+    REPLY_CHUNK_ACK,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
     REPLY_DOWNLOAD_SINGLE,
@@ -17,11 +22,11 @@ from openeasysync.constants import (
     REPLY_PRECHECK_BATCH_EXT,
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
+    REPLY_UPLOAD_BATCH_ERROR,
     STATUS_ACTIVE_DIR_ACK,
     STATUS_ERROR,
     STATUS_EXISTS,
     STATUS_OK,
-    STATUS_UPLOAD_SINGLE_DONE,
 )
 from openeasysync.protocol.commands import (
     BatchPrecheckExtRecord,
@@ -39,7 +44,6 @@ from openeasysync.protocol.commands import (
     encode_query_root,
     encode_rename_dir,
     encode_rename_file,
-    encode_upload_single,
 )
 from openeasysync.protocol.directory_entry import (
     Entry552,
@@ -55,6 +59,12 @@ class TransferManager:
 
     def __init__(self, session: SessionManager):
         self.session = session
+        self._next_item_id = 1
+
+    def _get_next_item_id(self) -> int:
+        cur = self._next_item_id
+        self._next_item_id = (self._next_item_id + 1) & 0x7FFFFFFF or 1
+        return cur
 
     def query_roots(self) -> list[Entry552]:
         """Queries remote peer root drives/volumes (Opcode 0x01)."""
@@ -162,44 +172,237 @@ class TransferManager:
             return rep["status"] == STATUS_EXISTS
         return False
 
+    def _upload_bytes(
+        self,
+        remote_dest_path: str,
+        file_data: bytes,
+        overwrite: bool = True,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """Internal helper streaming in-memory file bytes using Opcodes 0x0A, 0x0C, and 0x0E."""
+        file_size = len(file_data)
+        dest_path_str = remote_dest_path.replace("/", "\\")
+        dest_path_bytes = dest_path_str.encode("utf-16le")
+        if len(dest_path_bytes) > 1024:
+            raise ValueError("Destination path exceeds 1024 bytes (EasySuite stack limit)")
+
+        req_id = self._get_next_item_id()
+        item_id = req_id
+
+        # 1. Pack Opcode 0x0A Correctly: <B B I Q H
+        header = struct.pack(
+            "<B B I Q H",
+            OP_UPLOAD_SINGLE,
+            0x01 if overwrite else 0x00,
+            req_id,
+            file_size,
+            len(dest_path_bytes),
+        )
+        cmd_packet = header + dest_path_bytes
+
+        # 2. Wait for Opcode 0x0A ACK (0xA1): Expect 24-byte reply
+        rep_bytes = self.session.send_command(cmd_packet, expected_opcodes=(REPLY_STATUS_ACK,))
+        if len(rep_bytes) < 24 or rep_bytes[0] != REPLY_STATUS_ACK:
+            raise OSError(
+                f"Invalid Opcode 0x0A reply (expected 24-byte 0xA1, got {len(rep_bytes)} bytes)"
+            )
+
+        status = struct.unpack_from("<I", rep_bytes, 5)[0]
+        if status == 0 and rep_bytes[2] != 0:
+            status = rep_bytes[2]
+
+        if status == 7:
+            if progress_callback:
+                progress_callback(0, 0)
+            return True
+
+        if status == 2:
+            raise FileExistsError(f"Destination file already exists on peer: {dest_path_str}")
+
+        if status == 6:
+            raise OSError(f"Remote disk is full: {dest_path_str}")
+
+        if status == 1:
+            win32_err = (
+                struct.unpack_from("<I", rep_bytes, 9)[0]
+                if len(rep_bytes) >= 13
+                else struct.unpack_from("<I", rep_bytes, 7)[0]
+            )
+            raise OSError(f"Upload failed: {dest_path_str} : {format_win32_error(win32_err)}")
+
+        if status != 0:
+            raise OSError(f"Upload failed with status {status}: {dest_path_str}")
+
+        # 3. Stream Chunks via Opcode 0x0C and Await 0xA5
+        chunk_size = 64000
+        total_chunks = (file_size + chunk_size - 1) // chunk_size if file_size > 0 else 1
+
+        bytes_sent = 0
+        for chunk_index in range(1, total_chunks + 1):
+            start = (chunk_index - 1) * chunk_size
+            end = min(start + chunk_size, file_size)
+            chunk_slice = file_data[start:end]
+
+            chunk_header = struct.pack(
+                "<B I I I I",
+                OP_FILE_CHUNK,
+                item_id,
+                chunk_index,
+                total_chunks,
+                len(chunk_slice),
+            )
+            ack_bytes = self.session.send_command(
+                chunk_header + chunk_slice,
+                expected_opcodes=(REPLY_CHUNK_ACK, REPLY_UPLOAD_BATCH_ERROR),
+            )
+
+            if ack_bytes[0] == REPLY_UPLOAD_BATCH_ERROR:
+                win32_err = struct.unpack_from("<I", ack_bytes, 1)[0] if len(ack_bytes) >= 5 else 0
+                raise OSError(f"Chunk write error: {format_win32_error(win32_err)}")
+
+            if len(ack_bytes) < 9 or ack_bytes[0] != REPLY_CHUNK_ACK:
+                raise OSError(f"Unexpected chunk ACK: {ack_bytes[:1]!r}")
+
+            ack_item_id, ack_chunk_idx = struct.unpack_from("<II", ack_bytes, 1)
+            if ack_item_id != item_id or ack_chunk_idx != chunk_index:
+                raise OSError(
+                    f"Chunk ACK mismatch: expected item {item_id} chunk {chunk_index}, got item {ack_item_id} chunk {ack_chunk_idx}"
+                )
+
+            bytes_sent += len(chunk_slice)
+            if progress_callback:
+                progress_callback(bytes_sent, file_size)
+
+        # 4. Finalize via Opcode 0x0E
+        self.session.send_packet(struct.pack("<B I H", OP_TRANSFER_COMPLETE, item_id, 0))
+        return True
+
     def upload_file(
         self,
         local_path: str,
         remote_dest_path: str,
         progress_callback: Callable[[int, int], None] | None = None,
+        overwrite: bool = False,
     ) -> bool:
-        """Uploads a single file to remote peer (Opcode 0x09)."""
-        stat = os.stat(local_path)
-        with open(local_path, "rb") as f:
-            file_data = f.read()
+        """Uploads a single file to remote peer using Opcodes 0x0A, 0x0C, and 0x0E."""
+        if not os.path.isfile(local_path):
+            raise FileNotFoundError(f"Local file not found: {local_path}")
 
-        if progress_callback:
-            progress_callback(len(file_data), len(file_data))
+        file_size = os.path.getsize(local_path)
+        filename = os.path.basename(local_path)
 
-        fd = Win32FindData(
-            file_attributes=128,
-            creation_time=unix_to_filetime(stat.st_ctime),
-            last_access_time=unix_to_filetime(stat.st_atime),
-            last_write_time=unix_to_filetime(stat.st_mtime),
-            file_size=stat.st_size,
-            filename=os.path.basename(local_path),
+        if remote_dest_path.endswith("\\") or remote_dest_path.endswith("/"):
+            cleaned_dest = remote_dest_path.rstrip("\\/")
+            dest_path_str = f"{cleaned_dest}\\{filename}"
+        elif "\\" in remote_dest_path or "/" in remote_dest_path:
+            dest_norm = remote_dest_path.replace("/", "\\")
+            dest_base = os.path.basename(dest_norm.rstrip("\\"))
+            if "." in filename and "." not in dest_base:
+                cleaned_dest = dest_norm.rstrip("\\")
+                dest_path_str = f"{cleaned_dest}\\{filename}"
+            else:
+                dest_path_str = dest_norm
+        else:
+            cleaned_dest = remote_dest_path.rstrip("\\")
+            dest_path_str = f"{cleaned_dest}\\{filename}"
+
+        dest_path_bytes = dest_path_str.encode("utf-16le")
+        if len(dest_path_bytes) > 1024:
+            raise ValueError("Destination path exceeds 1024 bytes (EasySuite stack limit)")
+
+        req_id = self._get_next_item_id()
+        item_id = req_id
+
+        # 1. Pack Opcode 0x0A Correctly: <B B I Q H
+        header = struct.pack(
+            "<B B I Q H",
+            OP_UPLOAD_SINGLE,
+            0x01 if overwrite else 0x00,
+            req_id,
+            file_size,
+            len(dest_path_bytes),
         )
+        cmd_packet = header + dest_path_bytes
 
-        cmd = encode_upload_single(remote_dest_path, fd, file_data)
-        rep_bytes = self.session.send_command(cmd)
-        rep = decode_reply(rep_bytes)
+        # 2. Wait for Opcode 0x0A ACK (0xA1): Expect 24-byte reply
+        rep_bytes = self.session.send_command(cmd_packet, expected_opcodes=(REPLY_STATUS_ACK,))
+        if len(rep_bytes) < 24 or rep_bytes[0] != REPLY_STATUS_ACK:
+            raise OSError(
+                f"Invalid Opcode 0x0A reply (expected 24-byte 0xA1, got {len(rep_bytes)} bytes)"
+            )
 
-        if rep["opcode"] == REPLY_STATUS_ACK:
-            if rep["status"] == STATUS_ERROR:
-                win32_err = rep.get("win32_error", 0)
-                raise OSError(
-                    f"Upload failed: {remote_dest_path} : {format_win32_error(win32_err)}"
+        # Unpack status (uint32_le at offset +0x05)
+        status = struct.unpack_from("<I", rep_bytes, 5)[0]
+        if status == 0 and rep_bytes[2] != 0:
+            status = rep_bytes[2]
+
+        if status == 7:
+            # The file was 0 bytes and is already completed
+            if progress_callback:
+                progress_callback(0, 0)
+            return True
+
+        if status == 2:
+            raise FileExistsError(f"Destination file already exists on peer: {dest_path_str}")
+
+        if status == 6:
+            raise OSError(f"Remote disk is full: {dest_path_str}")
+
+        if status == 1:
+            win32_err = (
+                struct.unpack_from("<I", rep_bytes, 9)[0]
+                if len(rep_bytes) >= 13
+                else struct.unpack_from("<I", rep_bytes, 7)[0]
+            )
+            raise OSError(f"Upload failed: {dest_path_str} : {format_win32_error(win32_err)}")
+
+        if status != 0:
+            raise OSError(f"Upload failed with status {status}: {dest_path_str}")
+
+        # 3. Stream Chunks via Opcode 0x0C and Await 0xA5:
+        chunk_size = 64000
+        total_chunks = (file_size + chunk_size - 1) // chunk_size if file_size > 0 else 1
+
+        bytes_sent = 0
+        with open(local_path, "rb") as f:
+            for chunk_index in range(1, total_chunks + 1):
+                chunk_data = f.read(chunk_size)
+                chunk_header = struct.pack(
+                    "<B I I I I",
+                    OP_FILE_CHUNK,
+                    item_id,
+                    chunk_index,
+                    total_chunks,
+                    len(chunk_data),
                 )
-            return rep["status"] in (STATUS_OK, STATUS_UPLOAD_SINGLE_DONE)
-        if rep["opcode"] == REPLY_ERROR_CODE:
-            win32_err = rep.get("win32_error", 0)
-            raise OSError(f"Upload failed: {remote_dest_path} : {format_win32_error(win32_err)}")
-        return False
+                ack_bytes = self.session.send_command(
+                    chunk_header + chunk_data,
+                    expected_opcodes=(REPLY_CHUNK_ACK, REPLY_UPLOAD_BATCH_ERROR),
+                )
+
+                if ack_bytes[0] == REPLY_UPLOAD_BATCH_ERROR:
+                    win32_err = (
+                        struct.unpack_from("<I", ack_bytes, 1)[0] if len(ack_bytes) >= 5 else 0
+                    )
+                    raise OSError(f"Chunk write error: {format_win32_error(win32_err)}")
+
+                if len(ack_bytes) < 9 or ack_bytes[0] != REPLY_CHUNK_ACK:
+                    raise OSError(f"Unexpected chunk ACK: {ack_bytes[:1]!r}")
+
+                ack_item_id, ack_chunk_idx = struct.unpack_from("<II", ack_bytes, 1)
+                if ack_item_id != item_id or ack_chunk_idx != chunk_index:
+                    raise OSError(
+                        f"Chunk ACK mismatch: expected item {item_id} chunk {chunk_index}, got item {ack_item_id} chunk {ack_chunk_idx}"
+                    )
+
+                bytes_sent += len(chunk_data)
+                if progress_callback:
+                    progress_callback(bytes_sent, file_size)
+
+        # 4. Finalize via Opcode 0x0E:
+        # 7 bytes: opcode (0x0E) + item_id (u32) + status (u16: 0 for success)
+        self.session.send_packet(struct.pack("<B I H", OP_TRANSFER_COMPLETE, item_id, 0))
+        return True
 
     def download_file(
         self,
@@ -325,10 +528,7 @@ class TransferManager:
                 parent = os.path.dirname(remote_target)
                 if parent:
                     self.create_dir(parent)
-                cmd = encode_upload_single(remote_target, rec.find_data, rec.data)
-                rep_bytes = self.session.send_command(cmd)
-                rep = decode_reply(rep_bytes)
-                if rep["opcode"] != REPLY_STATUS_ACK:
+                if not self._upload_bytes(remote_target, rec.data, overwrite=True):
                     return False
         return True
 

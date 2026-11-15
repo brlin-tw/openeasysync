@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from openeasysync.constants import (
+    OP_ABORT_UPLOAD,
+    OP_CANCEL_KEEP_PARTIAL,
     OP_CANCEL_TRANSFER,
     OP_CREATE_DIR,
     OP_DELETE_DIR,
@@ -16,6 +18,7 @@ from openeasysync.constants import (
     OP_EXTENDED_XML_MAX,
     OP_EXTENDED_XML_MIN,
     OP_EXTRA_XML,
+    OP_FILE_CHUNK,
     OP_LIST_DIR,
     OP_NOTIFY_ACTIVE_DIR,
     OP_PLUGIN_RPC,
@@ -30,6 +33,7 @@ from openeasysync.constants import (
     OP_RENAME_DIR,
     OP_RENAME_FILE,
     OP_SET_MAC_MODE,
+    OP_TRANSFER_COMPLETE,
     OP_UPLOAD_SINGLE,
     OP_VERIFY_PEER_NAME,
     WIN32_FIND_DATA_SIZE,
@@ -135,15 +139,90 @@ def encode_rename_dir(old_path: str, new_path: str, encoding: str = "utf-8") -> 
 
 def encode_upload_single(
     dest_path: str,
-    find_data: Win32FindData,
-    file_data: bytes,
-    encoding: str = "utf-8",
+    file_size: int | Win32FindData = 0,
+    req_id: int | bytes = 1,
+    overwrite: bool = False,
+    encoding: str = "utf-16le",
 ) -> bytes:
-    """Opcode 0x0A: Single File Upload Request."""
-    path_b = dest_path.encode(encoding, errors="replace")
-    fd_b = find_data.pack(encoding=encoding)
-    header = bytes([OP_UPLOAD_SINGLE]) + struct.pack("<II", len(path_b), len(file_data)) + fd_b
-    return header + path_b + file_data
+    """Opcode 0x0A: Single File Upload Request.
+
+    Wire layout (Section 4.2.4):
+    [0x0A][flags:u8][req_id:u32_le][file_size:u64_le][dest_path_len:u16_le][dest_path:wchar_t]
+    16-byte fixed header followed by UTF-16LE wchar_t destination path including filename.
+    """
+    actual_size = 0
+    actual_req_id = 1
+    actual_overwrite = overwrite
+
+    if isinstance(file_size, Win32FindData):
+        actual_size = file_size.file_size
+        if isinstance(req_id, (bytes, bytearray)):
+            actual_size = len(req_id)
+        actual_req_id = 1
+    elif isinstance(file_size, int):
+        actual_size = file_size
+        if isinstance(req_id, int):
+            actual_req_id = req_id
+
+    dest_path_bytes = dest_path.encode(encoding, errors="replace")
+    if len(dest_path_bytes) > 1024:
+        raise ValueError("Destination path exceeds 1024 bytes (EasySuite stack limit)")
+
+    header = struct.pack(
+        "<BBIQH",
+        OP_UPLOAD_SINGLE,
+        0x01 if actual_overwrite else 0x00,
+        actual_req_id & 0xFFFFFFFF,
+        actual_size,
+        len(dest_path_bytes),
+    )
+    return header + dest_path_bytes
+
+
+def encode_file_chunk(
+    item_id: int,
+    chunk_index: int,
+    total_chunks: int,
+    chunk_data: bytes,
+) -> bytes:
+    """Opcode 0x0C: Upload File Data Chunk (Section 4.2.6).
+
+    Framing: [0x0C][item_id:u32_le][chunk_index:u32_le][total_chunks:u32_le][chunk_len:u32_le][data:bytes]
+    17-byte header followed by chunk_data.
+    """
+    header = struct.pack(
+        "<BIIII",
+        OP_FILE_CHUNK,
+        item_id & 0xFFFFFFFF,
+        chunk_index & 0xFFFFFFFF,
+        total_chunks & 0xFFFFFFFF,
+        len(chunk_data),
+    )
+    return header + chunk_data
+
+
+def encode_transfer_complete(item_id: int = 1, status: int = 0) -> bytes:
+    """Opcode 0x0E: Acknowledge File Transfer Completion (7 bytes).
+
+    Framing: [0x0E][item_id:u32_le][status:u16_le]
+    """
+    return struct.pack("<BIH", OP_TRANSFER_COMPLETE, item_id & 0xFFFFFFFF, status & 0xFFFF)
+
+
+def encode_abort_upload(item_id: int = 1, status: int = 0) -> bytes:
+    """Opcode 0x0D: Abort Single File Upload (Delete Partial) (9 bytes).
+
+    Framing: [0x0D][item_id:u32_le][status:u32_le]
+    """
+    return struct.pack("<BII", OP_ABORT_UPLOAD, item_id & 0xFFFFFFFF, status & 0xFFFFFFFF)
+
+
+def encode_cancel_keep_partial(item_id: int = 1, status: int = 0) -> bytes:
+    """Opcode 0x0F: Cancel Single File Transfer (Keep Partial) (9 bytes).
+
+    Framing: [0x0F][item_id:u32_le][status:u32_le]
+    """
+    return struct.pack("<BII", OP_CANCEL_KEEP_PARTIAL, item_id & 0xFFFFFFFF, status & 0xFFFFFFFF)
 
 
 def encode_download_single(src_path: str, encoding: str = "utf-8") -> bytes:
@@ -293,12 +372,29 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         OP_DELETE_DIR,
         OP_CREATE_DIR,
         OP_DOWNLOAD_SINGLE,
-        OP_QUERY_SPACE,
-        OP_PRECHECK_SINGLE,
     ):
         path_len = struct.unpack_from("<I", payload, 1)[0]
         path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
         return {"opcode": opcode, "path": path_str}
+
+    if opcode == OP_QUERY_SPACE:
+        if len(payload) >= 7 and struct.calcsize("<IH") == 6:
+            # Check if Opcode 0x0E is Acknowledge File Transfer Completion (7 bytes)
+            item_id, status = struct.unpack_from("<IH", payload, 1)
+            return {"opcode": OP_TRANSFER_COMPLETE, "item_id": item_id, "status": status}
+        path_len = struct.unpack_from("<I", payload, 1)[0]
+        path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
+        return {"opcode": opcode, "path": path_str}
+
+    if opcode in (OP_CANCEL_KEEP_PARTIAL, OP_PRECHECK_SINGLE):
+        if len(payload) == 9:
+            item_id, status = struct.unpack_from("<II", payload, 1)
+            return {"opcode": OP_CANCEL_KEEP_PARTIAL, "item_id": item_id, "status": status}
+        if len(payload) >= 5:
+            path_len = struct.unpack_from("<I", payload, 1)[0]
+            path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
+            return {"opcode": OP_PRECHECK_SINGLE, "path": path_str}
+        return {"opcode": OP_PRECHECK_SINGLE, "path": ""}
 
     if opcode in (OP_RENAME, OP_RENAME_FILE, OP_RENAME_DIR):
         old_len, new_len = struct.unpack_from("<II", payload, 1)
@@ -307,6 +403,19 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         return {"opcode": opcode, "old_path": old_path, "new_path": new_path}
 
     if opcode == OP_UPLOAD_SINGLE:
+        if len(payload) >= 16:
+            flags, req_id, file_size, path_len = struct.unpack_from("<BIQH", payload, 1)
+            raw_path = payload[16 : 16 + path_len]
+            dest_path = raw_path.decode("utf-16le", errors="replace")
+            return {
+                "opcode": OP_UPLOAD_SINGLE,
+                "flags": flags,
+                "overwrite": bool(flags & 0x01),
+                "req_id": req_id,
+                "file_size": file_size,
+                "dest_path": dest_path,
+            }
+        # Legacy fallback
         path_len, data_len = struct.unpack_from("<II", payload, 1)
         fd = Win32FindData.unpack(payload[9 : 9 + WIN32_FIND_DATA_SIZE], encoding=encoding)
         path_start = 9 + WIN32_FIND_DATA_SIZE
@@ -317,7 +426,25 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             "dest_path": dest_path,
             "find_data": fd,
             "file_data": file_data,
+            "file_size": data_len,
+            "flags": 0,
+            "overwrite": False,
+            "req_id": 1,
         }
+
+    if opcode == OP_FILE_CHUNK:
+        if len(payload) >= 17:
+            item_id, chunk_index, total_chunks, chunk_len = struct.unpack_from("<IIII", payload, 1)
+            chunk_data = payload[17 : 17 + chunk_len]
+            return {
+                "opcode": OP_FILE_CHUNK,
+                "item_id": item_id,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "chunk_len": chunk_len,
+                "chunk_data": chunk_data,
+            }
+        return {"opcode": OP_FILE_CHUNK, "raw": payload}
 
     if opcode == OP_DOWNLOAD_BATCH:
         if len(payload) < 3:
@@ -332,7 +459,10 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             offset += 4 + p_len
         return {"opcode": OP_DOWNLOAD_BATCH, "paths": paths}
 
-    if opcode == OP_CANCEL_TRANSFER:
+    if opcode in (OP_CANCEL_TRANSFER, OP_ABORT_UPLOAD):
+        if len(payload) == 9:
+            item_id, status = struct.unpack_from("<II", payload, 1)
+            return {"opcode": OP_ABORT_UPLOAD, "item_id": item_id, "status": status}
         return {"opcode": OP_CANCEL_TRANSFER}
 
     if opcode == OP_SET_MAC_MODE:

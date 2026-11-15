@@ -9,6 +9,7 @@ from typing import Any
 
 from openeasysync.constants import (
     DIR_ENTRY_SIZE,
+    REPLY_CHUNK_ACK,
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
@@ -95,10 +96,29 @@ def encode_status_ack(
     req_id: int = 0,
     win32_error: int = 0,
 ) -> bytes:
-    """Opcode 0xA1: Command Status / ACK (24-byte structured response header)."""
-    return bytes([REPLY_STATUS_ACK, req_opcode & 0xFF, status & 0xFF]) + struct.pack(
-        "<II13s", req_id & 0xFFFFFFFF, win32_error & 0xFFFFFFFF, b"\x00" * 13
+    """Opcode 0xA1: Command Status / ACK (24-byte structured response header).
+
+    Framing: [0xA1][req_opcode:u8][status:u8][req_id:u16_le][status:u32_le][win32_error:u32_le][reserved:11B]
+    Guarantees status is present at both offset +0x02 (uint8) and offset +0x05 (uint32_le).
+    """
+    return struct.pack(
+        "<BBBHI I 11s",
+        REPLY_STATUS_ACK,
+        req_opcode & 0xFF,
+        status & 0xFF,
+        req_id & 0xFFFF,
+        status & 0xFFFFFFFF,
+        win32_error & 0xFFFFFFFF,
+        b"\x00" * 11,
     )
+
+
+def encode_chunk_ack(item_id: int, chunk_index: int) -> bytes:
+    """Opcode 0xA5: Upload File Data Chunk ACK (9 bytes).
+
+    Framing: [0xA5][item_id:u32_le][chunk_index:u32_le] (Section 4.2.6).
+    """
+    return struct.pack("<BII", REPLY_CHUNK_ACK, item_id & 0xFFFFFFFF, chunk_index & 0xFFFFFFFF)
 
 
 def encode_error_code(win32_error: int, req_opcode: int = 0, req_id: int = 0) -> bytes:
@@ -207,7 +227,9 @@ def encode_precheck_batch_reply(conflicts: list[str], encoding: str = "utf-8") -
     return bytes(body)
 
 
-def encode_upload_batch_error(win32_error: int, failed_path: str, encoding: str = "utf-8") -> bytes:
+def encode_upload_batch_error(
+    win32_error: int, failed_path: str = "", encoding: str = "utf-8"
+) -> bytes:
     """Opcode 0xA9: Batch Upload Error Notification."""
     pb = failed_path.encode(encoding, errors="replace")
     return bytes([REPLY_UPLOAD_BATCH_ERROR]) + struct.pack("<II", win32_error, len(pb)) + pb
@@ -261,11 +283,20 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
     if opcode == REPLY_STATUS_ACK:
         if len(payload) >= 11:
             req_op, status_code = payload[1], payload[2]
-            req_id, win32_err = struct.unpack_from("<II", payload, 3)
+            status_offset_5 = (
+                struct.unpack_from("<I", payload, 5)[0] if len(payload) >= 9 else status_code
+            )
+            status = status_offset_5 if status_offset_5 != 0 else status_code
+            win32_err = 0
+            if len(payload) >= 13:
+                win32_err = struct.unpack_from("<I", payload, 9)[0]
+            if win32_err == 0 and len(payload) >= 11:
+                win32_err = struct.unpack_from("<I", payload, 7)[0]
+            req_id = struct.unpack_from("<H", payload, 3)[0]
             return {
                 "opcode": REPLY_STATUS_ACK,
                 "req_opcode": req_op,
-                "status": status_code,
+                "status": status,
                 "req_id": req_id,
                 "win32_error": win32_err,
             }
@@ -334,7 +365,14 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             "file_data": file_data,
         }
 
-    if opcode == REPLY_DOWNLOAD_BATCH_STREAM:
+    if opcode in (REPLY_CHUNK_ACK, REPLY_DOWNLOAD_BATCH_STREAM):
+        if len(payload) == 9:
+            item_id, chunk_index = struct.unpack_from("<II", payload, 1)
+            return {
+                "opcode": REPLY_CHUNK_ACK,
+                "item_id": item_id,
+                "chunk_index": chunk_index,
+            }
         count = struct.unpack_from("<I", payload, 1)[0]
         records: list[BatchDownloadStreamRecord] = []
         offset = 5

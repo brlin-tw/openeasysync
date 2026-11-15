@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Unit tests for wire protocol codecs, commands, replies, XML, and path mapping."""
 
+import struct
+
+import pytest
+
 from openeasysync.constants import (
     OP_CANCEL_TRANSFER,
     OP_CREATE_DIR,
@@ -9,6 +13,7 @@ from openeasysync.constants import (
     OP_DELETE_FILE,
     OP_DOWNLOAD_BATCH,
     OP_DOWNLOAD_SINGLE,
+    OP_FILE_CHUNK,
     OP_LIST_DIR,
     OP_NOTIFY_ACTIVE_DIR,
     OP_PRECHECK_BATCH,
@@ -19,10 +24,12 @@ from openeasysync.constants import (
     OP_QUERY_SPACE,
     OP_RENAME_DIR,
     OP_RENAME_FILE,
+    OP_TRANSFER_COMPLETE,
     OP_UPLOAD_SINGLE,
     OP_VERIFY_PEER_NAME,
     OP_VNIC_SWITCH,
     OP_XML_CONTROL,
+    REPLY_CHUNK_ACK,
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
@@ -45,6 +52,7 @@ from openeasysync.protocol.commands import (
     encode_download_batch,
     encode_download_single,
     encode_extended_xml,
+    encode_file_chunk,
     encode_list_dir,
     encode_notify_active_dir,
     encode_precheck_batch,
@@ -55,6 +63,7 @@ from openeasysync.protocol.commands import (
     encode_query_space,
     encode_rename_dir,
     encode_rename_file,
+    encode_transfer_complete,
     encode_upload_single,
     encode_verify_peer_name,
     encode_xml_control,
@@ -66,6 +75,7 @@ from openeasysync.protocol.replies import (
     BatchDownloadStreamRecord,
     BatchPrecheckExtConflict,
     decode_reply,
+    encode_chunk_ack,
     encode_download_batch_done,
     encode_download_batch_empty,
     encode_download_batch_stream,
@@ -78,6 +88,7 @@ from openeasysync.protocol.replies import (
     encode_status_ack,
 )
 from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
+from openeasysync.server.handler import PeerServerHandler
 
 
 def test_command_encoders_and_decoders():
@@ -142,11 +153,45 @@ def test_command_encoders_and_decoders():
 
     # 0x0A Upload Single
     fd = Win32FindData(filename="doc.txt", file_size=12)
-    c0a = decode_command(encode_upload_single("C:\\doc.txt", fd, b"Hello World!"))
+    raw0a = encode_upload_single("C:\\doc.txt", file_size=12, req_id=1, overwrite=False)
+    assert len(raw0a) == 16 + len("C:\\doc.txt".encode("utf-16le"))
+    c0a = decode_command(raw0a)
     assert c0a["opcode"] == OP_UPLOAD_SINGLE
     assert c0a["dest_path"] == "C:\\doc.txt"
-    assert c0a["file_data"] == b"Hello World!"
-    assert c0a["find_data"].filename == "doc.txt"
+    assert c0a["file_size"] == 12
+    assert c0a["req_id"] == 1
+    assert c0a["overwrite"] is False
+
+    # 0x0A destination path limit (> 1024 bytes)
+    oversized_path = "C:\\" + "x" * 600
+    with pytest.raises(ValueError, match="1024 bytes"):
+        encode_upload_single(oversized_path, file_size=100)
+
+    # 0x0C Upload File Data Chunk
+    raw0c = encode_file_chunk(item_id=1, chunk_index=1, total_chunks=3, chunk_data=b"chunk data")
+    assert len(raw0c) == 17 + len(b"chunk data")
+    c0c = decode_command(raw0c)
+    assert c0c["opcode"] == OP_FILE_CHUNK
+    assert c0c["item_id"] == 1
+    assert c0c["chunk_index"] == 1
+    assert c0c["total_chunks"] == 3
+    assert c0c["chunk_data"] == b"chunk data"
+
+    # 0xA5 Upload File Data Chunk ACK
+    raw_a5_ack = encode_chunk_ack(item_id=1, chunk_index=1)
+    assert len(raw_a5_ack) == 9
+    r_a5_ack = decode_reply(raw_a5_ack)
+    assert r_a5_ack["opcode"] == REPLY_CHUNK_ACK
+    assert r_a5_ack["item_id"] == 1
+    assert r_a5_ack["chunk_index"] == 1
+
+    # 0x0E Acknowledge File Transfer Completion
+    raw0e = encode_transfer_complete(item_id=1, status=0)
+    assert len(raw0e) == 7
+    c0e = decode_command(raw0e)
+    assert c0e["opcode"] == OP_TRANSFER_COMPLETE
+    assert c0e["item_id"] == 1
+    assert c0e["status"] == 0
 
     # 0x0B Download Single
     c0b = decode_command(encode_download_single("C:\\doc.txt"))
@@ -350,3 +395,50 @@ def test_format_win32_error():
     assert format_win32_error(5) == "Access is denied."
     assert format_win32_error(21) == "The device is not ready."
     assert format_win32_error(999999) == "Win32 error 999999"
+
+
+def test_upload_protocol_wire_framing_and_server(tmp_path):
+    """Verify single file upload wire framing: 0x0A, 0xA1, 0x0C, 0xA5, 0x0E."""
+    mapper = PathMapper(virtual_root=str(tmp_path))
+    handler = PeerServerHandler(path_mapper=mapper)
+
+    # 1. 0x0A with zero-length file -> returns 0xA1 with status=7
+    cmd_zero = encode_upload_single("C:\\empty.txt", file_size=0, req_id=10, overwrite=False)
+    replies_zero = handler.handle_command(cmd_zero)
+    assert len(replies_zero) == 1
+    assert len(replies_zero[0]) == 24
+    assert replies_zero[0][0] == 0xA1
+    # Unpack status (uint32_le at offset +0x05)
+    status = struct.unpack_from("<I", replies_zero[0], 5)[0]
+    assert status == 7
+    assert (tmp_path / "empty.txt").exists()
+
+    # 2. 0x0A with existing file and overwrite=False -> conflict status=2
+    cmd_conflict = encode_upload_single("C:\\empty.txt", file_size=10, req_id=11, overwrite=False)
+    replies_conflict = handler.handle_command(cmd_conflict)
+    assert len(replies_conflict) == 1
+    assert struct.unpack_from("<I", replies_conflict[0], 5)[0] == 2
+
+    # 3. 0x0A with overwrite=True -> succeeds status=0
+    cmd_ow = encode_upload_single("C:\\file.txt", file_size=11, req_id=12, overwrite=True)
+    replies_ow = handler.handle_command(cmd_ow)
+    assert len(replies_ow) == 1
+    assert struct.unpack_from("<I", replies_ow[0], 5)[0] == 0
+
+    # 4. Stream 0x0C chunk -> returns 9-byte 0xA5 ACK
+    chunk_data = b"Hello World"
+    cmd_chunk = encode_file_chunk(item_id=12, chunk_index=1, total_chunks=1, chunk_data=chunk_data)
+    replies_chunk = handler.handle_command(cmd_chunk)
+    assert len(replies_chunk) == 1
+    assert len(replies_chunk[0]) == 9
+    assert replies_chunk[0][0] == 0xA5
+    dec_ack = decode_reply(replies_chunk[0])
+    assert dec_ack["opcode"] == 0xA5
+    assert dec_ack["item_id"] == 12
+    assert dec_ack["chunk_index"] == 1
+
+    # 5. Finalize via 0x0E -> closes handle, returns no replies
+    cmd_fin = encode_transfer_complete(item_id=12, status=0)
+    replies_fin = handler.handle_command(cmd_fin)
+    assert replies_fin == []
+    assert (tmp_path / "file.txt").read_bytes() == b"Hello World"

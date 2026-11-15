@@ -207,3 +207,46 @@ def test_e2e_list_dir_error_handling(dual_host_setup):
         transfer_a.list_dir("C:\\nonexistent_dir")
     assert "The system cannot find the path specified." in str(exc_info.value)
     assert "C:\\nonexistent_dir" in str(exc_info.value)
+
+
+def test_e2e_single_file_upload_zero_length(dual_host_setup):
+    """Verify single file upload of a 0-byte file (A -> B) completes via status 7."""
+    dir_a = dual_host_setup["dir_a"]
+    dir_b = dual_host_setup["dir_b"]
+    transfer_a = dual_host_setup["transfer_a"]
+
+    empty_src = dir_a / "empty_source.txt"
+    empty_src.write_bytes(b"")
+
+    success = transfer_a.upload_file(str(empty_src), "C:\\empty_dest.txt")
+    assert success is True
+
+    dest_file = dir_b / "empty_dest.txt"
+    assert dest_file.exists()
+    assert dest_file.stat().st_size == 0
+
+
+def test_e2e_single_file_upload_conflict(dual_host_setup):
+    """Verify upload conflict returns error when overwrite=False and succeeds when overwrite=True."""
+    dir_a = dual_host_setup["dir_a"]
+    dir_b = dual_host_setup["dir_b"]
+    transfer_a = dual_host_setup["transfer_a"]
+
+    src = dir_a / "conflict.txt"
+    src.write_text("New content from A")
+
+    # Pre-create file on Host B
+    existing_b = dir_b / "conflict.txt"
+    existing_b.write_text("Old content on B")
+
+    # Upload with overwrite=False should raise FileExistsError
+    with pytest.raises(FileExistsError):
+        transfer_a.upload_file(str(src), "C:\\conflict.txt", overwrite=False)
+
+    # Content on B should be untouched
+    assert existing_b.read_text() == "Old content on B"
+
+    # Upload with overwrite=True should succeed
+    success = transfer_a.upload_file(str(src), "C:\\conflict.txt", overwrite=True)
+    assert success is True
+    assert existing_b.read_text() == "New content from A"
