@@ -105,36 +105,70 @@ def encode_list_dir(dir_path: str, encoding: str = "utf-16le") -> bytes:
     return bytes([OP_LIST_DIR]) + struct.pack("<H", len(path_bytes)) + path_bytes
 
 
-def encode_delete_file(file_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x08: Delete Remote File."""
-    path_bytes = file_path.encode(encoding, errors="replace")
-    return bytes([OP_DELETE_FILE]) + struct.pack("<I", len(path_bytes)) + path_bytes
+def _encode_single_path_cmd(
+    opcode: int,
+    path: str,
+    req_id: int = 1,
+    encoding: str = "utf-16le",
+    label: str = "Path",
+) -> bytes:
+    """Packs a 7-byte management header [opcode:u8][req_id:u32_le][path_len:u16_le] + path."""
+    path_bytes = path.encode(encoding, errors="replace")
+    if len(path_bytes) > 1024:
+        raise ValueError(f"{label} exceeds 1024-byte EasySuite stack buffer limit")
+    return struct.pack("<BIH", opcode, req_id & 0xFFFFFFFF, len(path_bytes)) + path_bytes
 
 
-def encode_delete_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x06: Remove Remote Directory."""
-    path_bytes = dir_path.encode(encoding, errors="replace")
-    return bytes([OP_REMOVE_DIR]) + struct.pack("<I", len(path_bytes)) + path_bytes
+def encode_delete_file(file_path: str, req_id: int = 1, encoding: str = "utf-16le") -> bytes:
+    """Opcode 0x08: Delete Remote File.
+
+    Wire layout (Section 4.2.8):
+    [0x08][req_id:u32_le][path_len:u16_le][file_path:wchar_t]
+    """
+    return _encode_single_path_cmd(
+        OP_DELETE_FILE, file_path, req_id=req_id, encoding=encoding, label="File path"
+    )
 
 
-def encode_create_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x07: Create Remote Directory."""
-    path_bytes = dir_path.encode(encoding, errors="replace")
-    return bytes([OP_CREATE_DIR]) + struct.pack("<I", len(path_bytes)) + path_bytes
+def encode_delete_dir(dir_path: str, req_id: int = 1, encoding: str = "utf-16le") -> bytes:
+    """Opcode 0x06: Remove Remote Directory.
+
+    Wire layout: [0x06][req_id:u32_le][path_len:u16_le][dir_path:wchar_t]
+    """
+    return _encode_single_path_cmd(
+        OP_REMOVE_DIR, dir_path, req_id=req_id, encoding=encoding, label="Directory path"
+    )
 
 
-def encode_rename_file(old_path: str, new_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x09: Rename Remote File."""
+def encode_create_dir(dir_path: str, req_id: int = 1, encoding: str = "utf-16le") -> bytes:
+    """Opcode 0x07: Create Remote Directory.
+
+    Wire layout: [0x07][req_id:u32_le][path_len:u16_le][dir_path:wchar_t]
+    """
+    return _encode_single_path_cmd(
+        OP_CREATE_DIR, dir_path, req_id=req_id, encoding=encoding, label="Directory path"
+    )
+
+
+def encode_rename_file(
+    old_path: str, new_path: str, req_id: int = 1, encoding: str = "utf-16le"
+) -> bytes:
+    """Opcode 0x09: Rename Remote File or Directory.
+
+    Wire layout: [0x09][req_id:u32_le][old_len:u16_le][new_len:u16_le][old_path:wchar_t][new_path:wchar_t]
+    """
     old_b = old_path.encode(encoding, errors="replace")
     new_b = new_path.encode(encoding, errors="replace")
-    return bytes([OP_RENAME]) + struct.pack("<II", len(old_b), len(new_b)) + old_b + new_b
+    if len(old_b) > 1024 or len(new_b) > 1024:
+        raise ValueError("Rename path exceeds 1024-byte EasySuite stack buffer limit")
+    return struct.pack("<BIHH", OP_RENAME, req_id & 0xFFFFFFFF, len(old_b), len(new_b)) + old_b + new_b
 
 
-def encode_rename_dir(old_path: str, new_path: str, encoding: str = "utf-8") -> bytes:
+def encode_rename_dir(
+    old_path: str, new_path: str, req_id: int = 1, encoding: str = "utf-16le"
+) -> bytes:
     """Opcode 0x09: Rename Remote Directory."""
-    old_b = old_path.encode(encoding, errors="replace")
-    new_b = new_path.encode(encoding, errors="replace")
-    return bytes([OP_RENAME]) + struct.pack("<II", len(old_b), len(new_b)) + old_b + new_b
+    return encode_rename_file(old_path, new_path, req_id=req_id, encoding=encoding)
 
 
 def encode_upload_single(
@@ -402,9 +436,10 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         OP_DELETE_DIR,
         OP_CREATE_DIR,
     ):
-        path_len = struct.unpack_from("<I", payload, 1)[0]
-        path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
-        return {"opcode": opcode, "path": path_str}
+        req_id, path_len = struct.unpack_from("<IH", payload, 1)
+        raw_path = payload[7 : 7 + path_len]
+        path_str = raw_path.decode("utf-16le", errors="replace")
+        return {"opcode": opcode, "req_id": req_id, "path": path_str}
 
     if opcode == OP_DOWNLOAD_SINGLE:
         if len(payload) >= 7:
@@ -453,10 +488,10 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         return {"opcode": OP_PRECHECK_SINGLE, "path": ""}
 
     if opcode in (OP_RENAME, OP_RENAME_FILE, OP_RENAME_DIR):
-        old_len, new_len = struct.unpack_from("<II", payload, 1)
-        old_path = payload[9 : 9 + old_len].decode(encoding, errors="replace")
-        new_path = payload[9 + old_len : 9 + old_len + new_len].decode(encoding, errors="replace")
-        return {"opcode": opcode, "old_path": old_path, "new_path": new_path}
+        req_id, old_len, new_len = struct.unpack_from("<IHH", payload, 1)
+        old_path = payload[9 : 9 + old_len].decode("utf-16le", errors="replace")
+        new_path = payload[9 + old_len : 9 + old_len + new_len].decode("utf-16le", errors="replace")
+        return {"opcode": opcode, "req_id": req_id, "old_path": old_path, "new_path": new_path}
 
     if opcode == OP_UPLOAD_SINGLE:
         if len(payload) >= 16:

@@ -124,38 +124,38 @@ class TransferManager:
             raise OSError(f"{remote_path} : {err_desc}")
         return []
 
-    def create_dir(self, remote_path: str) -> bool:
+    def create_dir(self, remote_path: str, req_id: int = 1) -> bool:
         """Creates a directory on remote peer (Opcode 0x07)."""
-        cmd = encode_create_dir(remote_path)
-        rep_bytes = self.session.send_command(cmd)
+        cmd = encode_create_dir(remote_path, req_id=req_id)
+        rep_bytes = self.session.send_command(cmd, expected_opcodes=(REPLY_STATUS_ACK,))
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
 
-    def delete_file(self, remote_path: str) -> bool:
+    def delete_file(self, remote_path: str, req_id: int = 1) -> bool:
         """Deletes a file on remote peer (Opcode 0x08)."""
-        cmd = encode_delete_file(remote_path)
-        rep_bytes = self.session.send_command(cmd)
+        cmd = encode_delete_file(remote_path, req_id=req_id)
+        rep_bytes = self.session.send_command(cmd, expected_opcodes=(REPLY_STATUS_ACK,))
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
 
-    def delete_dir(self, remote_path: str) -> bool:
+    def delete_dir(self, remote_path: str, req_id: int = 1) -> bool:
         """Recursively deletes a directory on remote peer (Opcode 0x06)."""
-        cmd = encode_delete_dir(remote_path)
-        rep_bytes = self.session.send_command(cmd)
+        cmd = encode_delete_dir(remote_path, req_id=req_id)
+        rep_bytes = self.session.send_command(cmd, expected_opcodes=(REPLY_STATUS_ACK,))
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
 
-    def rename_file(self, old_path: str, new_path: str) -> bool:
+    def rename_file(self, old_path: str, new_path: str, req_id: int = 1) -> bool:
         """Renames a file on remote peer (Opcode 0x09)."""
-        cmd = encode_rename_file(old_path, new_path)
-        rep_bytes = self.session.send_command(cmd)
+        cmd = encode_rename_file(old_path, new_path, req_id=req_id)
+        rep_bytes = self.session.send_command(cmd, expected_opcodes=(REPLY_STATUS_ACK,))
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
 
-    def rename_dir(self, old_path: str, new_path: str) -> bool:
-        """Renames a directory on remote peer (Opcode 0x08)."""
-        cmd = encode_rename_dir(old_path, new_path)
-        rep_bytes = self.session.send_command(cmd)
+    def rename_dir(self, old_path: str, new_path: str, req_id: int = 1) -> bool:
+        """Renames a directory on remote peer (Opcode 0x09)."""
+        cmd = encode_rename_dir(old_path, new_path, req_id=req_id)
+        rep_bytes = self.session.send_command(cmd, expected_opcodes=(REPLY_STATUS_ACK,))
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
 

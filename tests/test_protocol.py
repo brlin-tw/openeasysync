@@ -536,3 +536,64 @@ def test_download_protocol_wire_framing_and_server(tmp_path):
         assert rep_chunk["item_id"] == 103
         assembled_bytes.extend(rep_chunk["data"])
     assert bytes(assembled_bytes) == large_content
+
+
+def test_file_management_wire_framing(tmp_path):
+    """Verify 0x08, 0x06, 0x07, and 0x09 wire framing (UTF-16LE + req_id + u16 lengths) and 0xA1 replies."""
+    # 1. Verify exact 7-byte header + UTF-16LE framing for 0x08 (Delete File)
+    target = "C:\\REUSE.toml"
+    expected_bytes = target.encode("utf-16-le")
+    raw_08 = encode_delete_file(target, req_id=42)
+    assert raw_08 == struct.pack("<BIH", OP_DELETE_FILE, 42, len(expected_bytes)) + expected_bytes
+    assert len(raw_08) == 7 + 2 * len(target)
+    dec_08 = decode_command(raw_08)
+    assert dec_08 == {"opcode": OP_DELETE_FILE, "req_id": 42, "path": target}
+
+    # 2. Verify symmetrical 7-byte header + UTF-16LE framing for 0x06 and 0x07
+    raw_06 = encode_delete_dir("C:\\EmptyDir", req_id=43)
+    assert len(raw_06) == 7 + 2 * len("C:\\EmptyDir")
+    assert decode_command(raw_06)["req_id"] == 43
+
+    raw_07 = encode_create_dir("C:\\NewDir", req_id=44)
+    assert len(raw_07) == 7 + 2 * len("C:\\NewDir")
+    assert decode_command(raw_07)["req_id"] == 44
+
+    # 3. Verify 9-byte header + UTF-16LE framing for 0x09 (Rename)
+    raw_09 = encode_rename_file("C:\\a.txt", "C:\\b.txt", req_id=45)
+    assert len(raw_09) == 9 + 2 * len("C:\\a.txt") + 2 * len("C:\\b.txt")
+    dec_09 = decode_command(raw_09)
+    assert dec_09 == {
+        "opcode": OP_RENAME_FILE,
+        "req_id": 45,
+        "old_path": "C:\\a.txt",
+        "new_path": "C:\\b.txt",
+    }
+
+    # 4. Verify 1024-byte stack buffer guard
+    with pytest.raises(ValueError, match="1024-byte"):
+        encode_delete_file("C:\\" + "a" * 512)
+
+    # 5. PeerServerHandler echoes req_opcode and req_id in 24-byte 0xA1 reply
+    mapper = PathMapper(virtual_root=str(tmp_path))
+    handler = PeerServerHandler(path_mapper=mapper)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("bye", encoding="utf-8")
+
+    reps = handler.handle_command(encode_delete_file("C:\\victim.txt", req_id=77))
+    assert len(reps) == 1
+    assert len(reps[0]) == 24
+    rep = decode_reply(reps[0])
+    assert rep["opcode"] == REPLY_STATUS_ACK
+    assert rep["req_opcode"] == OP_DELETE_FILE
+    assert rep["req_id"] == 77
+    assert rep["status"] == STATUS_OK
+    assert not victim.exists()
+
+    # Deleting a missing file returns status=1 (ERROR) with req_id echoed
+    reps_err = handler.handle_command(encode_delete_file("C:\\missing.txt", req_id=78))
+    rep_err = decode_reply(reps_err[0])
+    assert rep_err["opcode"] == REPLY_STATUS_ACK
+    assert rep_err["req_opcode"] == OP_DELETE_FILE
+    assert rep_err["req_id"] == 78
+    assert rep_err["status"] == STATUS_ERROR
+    assert rep_err["win32_error"] == 2

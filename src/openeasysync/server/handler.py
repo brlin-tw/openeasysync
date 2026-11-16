@@ -109,16 +109,18 @@ class PeerServerHandler:
             return self._handle_list_dir(cmd["path"])
 
         if opcode == OP_DELETE_FILE:
-            return [self._handle_delete_file(cmd["path"])]
+            return [self._handle_delete_file(cmd["path"], req_id=cmd.get("req_id", 0))]
 
         if opcode == OP_DELETE_DIR:
-            return [self._handle_delete_dir(cmd["path"])]
+            return [self._handle_delete_dir(cmd["path"], req_id=cmd.get("req_id", 0))]
 
         if opcode == OP_CREATE_DIR:
-            return [self._handle_create_dir(cmd["path"])]
+            return [self._handle_create_dir(cmd["path"], req_id=cmd.get("req_id", 0))]
 
         if opcode in (OP_RENAME_FILE, OP_RENAME_DIR):
-            return [self._handle_rename(cmd["old_path"], cmd["new_path"])]
+            return [
+                self._handle_rename(cmd["old_path"], cmd["new_path"], req_id=cmd.get("req_id", 0))
+            ]
 
         if opcode == OP_UPLOAD_SINGLE:
             return self._handle_upload_single(cmd)
@@ -228,52 +230,52 @@ class PeerServerHandler:
         except Exception:
             return [encode_error_code(3, req_opcode=OP_LIST_DIR)]
 
-    def _handle_delete_file(self, file_path: str) -> bytes:
+    def _handle_delete_file(self, file_path: str, req_id: int = 0) -> bytes:
         local_path = self.mapper.wire_to_local(file_path)
         try:
             if os.path.isfile(local_path) or os.path.islink(local_path):
                 os.remove(local_path)
-                return encode_status_ack(STATUS_OK)
-            return encode_error_code(2)  # ERROR_FILE_NOT_FOUND
+                return encode_status_ack(STATUS_OK, req_opcode=OP_DELETE_FILE, req_id=req_id)
+            return encode_error_code(2, req_opcode=OP_DELETE_FILE, req_id=req_id)  # ERROR_FILE_NOT_FOUND
         except PermissionError:
-            return encode_error_code(5)  # ERROR_ACCESS_DENIED
+            return encode_error_code(5, req_opcode=OP_DELETE_FILE, req_id=req_id)  # ERROR_ACCESS_DENIED
         except Exception:
-            return encode_error_code(2)
+            return encode_error_code(2, req_opcode=OP_DELETE_FILE, req_id=req_id)
 
-    def _handle_delete_dir(self, dir_path: str) -> bytes:
+    def _handle_delete_dir(self, dir_path: str, req_id: int = 0) -> bytes:
         local_path = self.mapper.wire_to_local(dir_path)
         try:
             if os.path.isdir(local_path):
                 shutil.rmtree(local_path)
-                return encode_status_ack(STATUS_OK)
-            return encode_error_code(3)  # ERROR_PATH_NOT_FOUND
+                return encode_status_ack(STATUS_OK, req_opcode=OP_DELETE_DIR, req_id=req_id)
+            return encode_error_code(3, req_opcode=OP_DELETE_DIR, req_id=req_id)  # ERROR_PATH_NOT_FOUND
         except PermissionError:
-            return encode_error_code(5)
+            return encode_error_code(5, req_opcode=OP_DELETE_DIR, req_id=req_id)
         except Exception:
-            return encode_error_code(3)
+            return encode_error_code(3, req_opcode=OP_DELETE_DIR, req_id=req_id)
 
-    def _handle_create_dir(self, dir_path: str) -> bytes:
+    def _handle_create_dir(self, dir_path: str, req_id: int = 0) -> bytes:
         local_path = self.mapper.wire_to_local(dir_path)
         try:
             os.makedirs(local_path, exist_ok=True)
-            return encode_status_ack(STATUS_OK)
+            return encode_status_ack(STATUS_OK, req_opcode=OP_CREATE_DIR, req_id=req_id)
         except PermissionError:
-            return encode_error_code(5)
+            return encode_error_code(5, req_opcode=OP_CREATE_DIR, req_id=req_id)
         except Exception:
-            return encode_error_code(3)
+            return encode_error_code(3, req_opcode=OP_CREATE_DIR, req_id=req_id)
 
-    def _handle_rename(self, old_path: str, new_path: str) -> bytes:
+    def _handle_rename(self, old_path: str, new_path: str, req_id: int = 0) -> bytes:
         local_old = self.mapper.wire_to_local(old_path)
         local_new = self.mapper.wire_to_local(new_path)
         try:
             os.rename(local_old, local_new)
-            return encode_status_ack(STATUS_OK)
+            return encode_status_ack(STATUS_OK, req_opcode=OP_RENAME_FILE, req_id=req_id)
         except PermissionError:
-            return encode_error_code(5)
+            return encode_error_code(5, req_opcode=OP_RENAME_FILE, req_id=req_id)
         except FileNotFoundError:
-            return encode_error_code(2)
+            return encode_error_code(2, req_opcode=OP_RENAME_FILE, req_id=req_id)
         except Exception:
-            return encode_error_code(3)
+            return encode_error_code(3, req_opcode=OP_RENAME_FILE, req_id=req_id)
 
     def _handle_upload_single(self, cmd: dict[str, Any]) -> list[bytes]:
         dest_path = cmd["dest_path"]
