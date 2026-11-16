@@ -4,6 +4,7 @@
 
 import logging
 import queue
+import struct
 import threading
 import time
 from collections.abc import Callable
@@ -12,12 +13,15 @@ from openeasysync.constants import (
     MODE_OFFLINE,
     MODE_TRANSFER_LINE,
     REPLY_STATUS_ACK,
+    REPLY_UPLOAD_BATCH_ERROR,
+    REPLY_UPLOAD_ERROR,
     STATUS_OK,
 )
 from openeasysync.framing.poller import LinkPoller
 from openeasysync.framing.reassembler import PacketReassembler
 from openeasysync.framing.splitter import PacketSplitter
 from openeasysync.protocol.path_mapping import PathMapper
+from openeasysync.protocol.replies import format_win32_error
 from openeasysync.server.handler import PeerServerHandler
 from openeasysync.transport.base import TransportBackend
 
@@ -58,6 +62,8 @@ class SessionManager:
         self._reply_queue: queue.Queue[bytes] = queue.Queue()
         self._streaming_queue: queue.Queue[bytes] = queue.Queue()
         self._active_stream_callback: Callable[[bytes], None] | None = None
+        self._upload_error_lock = threading.Lock()
+        self._upload_error: OSError | None = None
 
     def _on_internal_activity(self) -> None:
         self._last_activity_time = time.time()
@@ -164,6 +170,31 @@ class SessionManager:
 
         # 3. Close transport handle
         self.transport.close()
+
+    def clear_upload_error(self) -> None:
+        """Clears any recorded asynchronous upload error before starting a transfer."""
+        with self._upload_error_lock:
+            self._upload_error = None
+
+    def check_upload_error(self) -> None:
+        """Raises any asynchronous upload error caught by the background dispatcher."""
+        with self._upload_error_lock:
+            err = self._upload_error
+        if err is not None:
+            raise err
+
+    def flush_tx(self, timeout: float = 10.0) -> None:
+        """Waits for queued TX blocks to drain, aborting on async upload errors."""
+        if not self._running:
+            self.check_upload_error()
+            return
+        start = time.time()
+        while not self.poller.tx_queue.empty():
+            self.check_upload_error()
+            if time.time() - start >= timeout:
+                raise TimeoutError(f"Timeout waiting for TX queue to drain after {timeout} seconds")
+            time.sleep(0.005)
+        self.check_upload_error()
 
     def send_packet(self, packet: bytes) -> None:
         """Sends a logical packet asynchronously without awaiting a reply."""
@@ -316,6 +347,23 @@ class SessionManager:
 
         # 1. Server Reply (0xA1..0xAC) -> routes to client waiting thread
         if 0xA1 <= opcode <= 0xAC:
+            if opcode == REPLY_UPLOAD_ERROR and len(message) == 9:
+                item_id, win32_err = struct.unpack_from("<II", message, 1)
+                err_msg = f"Upload write error (item {item_id}): {format_win32_error(win32_err)}"
+                logger.error("Async upload error 0xA5 received: %s", err_msg)
+                with self._upload_error_lock:
+                    if self._upload_error is None:
+                        self._upload_error = OSError(err_msg)
+                return
+            if opcode == REPLY_UPLOAD_BATCH_ERROR and len(message) >= 5:
+                win32_err = struct.unpack_from("<I", message, 1)[0]
+                err_msg = f"Batch upload write error: {format_win32_error(win32_err)}"
+                logger.error("Async upload error 0xA9 received: %s", err_msg)
+                with self._upload_error_lock:
+                    if self._upload_error is None:
+                        self._upload_error = OSError(err_msg)
+                self._reply_queue.put(message)
+                return
             self._reply_queue.put(message)
             return
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Peer server request dispatcher executing local filesystem operations for the remote peer."""
 
+import errno
 import os
 import shutil
 import sys
@@ -62,7 +63,6 @@ from openeasysync.protocol.replies import (
     BatchDownloadEmptyRecord,
     BatchDownloadStreamRecord,
     BatchPrecheckExtConflict,
-    encode_chunk_ack,
     encode_download_batch_done,
     encode_download_batch_empty,
     encode_download_batch_stream,
@@ -74,6 +74,7 @@ from openeasysync.protocol.replies import (
     encode_roots_reply,
     encode_status_ack,
     encode_upload_batch_error,
+    encode_upload_error,
 )
 from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
 
@@ -391,21 +392,36 @@ class PeerServerHandler:
     def _handle_file_chunk(self, cmd: dict[str, Any]) -> list[bytes]:
         item_id = cmd["item_id"]
         chunk_index = cmd["chunk_index"]
+        total_chunks = cmd.get("total_chunks", 0)
         chunk_data = cmd["chunk_data"]
         upload_ctx = self._active_uploads.get(item_id)
         if not upload_ctx:
             return [
-                encode_upload_batch_error(win32_error=6, failed_path="")
+                encode_upload_error(item_id=item_id, win32_error=6)
             ]  # ERROR_INVALID_HANDLE
         try:
             upload_ctx["file"].write(chunk_data)
             upload_ctx["file"].flush()
             upload_ctx["written_bytes"] += len(chunk_data)
-            return [encode_chunk_ack(item_id=item_id, chunk_index=chunk_index)]
+            if total_chunks > 0 and chunk_index >= total_chunks:
+                upload_ctx["file"].close()
+                self._active_uploads.pop(item_id, None)
+            return []
+        except OSError as exc:
+            win32_err = 112 if exc.errno == errno.ENOSPC else 5
+            try:
+                upload_ctx["file"].close()
+            except Exception:
+                pass
+            self._active_uploads.pop(item_id, None)
+            return [encode_upload_error(item_id=item_id, win32_error=win32_err)]
         except Exception:
-            return [
-                encode_upload_batch_error(win32_error=112, failed_path=upload_ctx.get("path", ""))
-            ]
+            try:
+                upload_ctx["file"].close()
+            except Exception:
+                pass
+            self._active_uploads.pop(item_id, None)
+            return [encode_upload_error(item_id=item_id, win32_error=112)]
 
     def _handle_transfer_complete(self, cmd: dict[str, Any]) -> list[bytes]:
         item_id = cmd.get("item_id", 0)

@@ -60,6 +60,7 @@ from openeasysync.protocol.replies import (
     encode_precheck_batch_reply,
     encode_status_ack,
     encode_upload_batch_error,
+    encode_upload_error,
     format_win32_error,
 )
 from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
@@ -112,6 +113,7 @@ __all__ = [
     "encode_download_batch_done",
     "encode_precheck_batch_reply",
     "encode_upload_batch_error",
+    "encode_upload_error",
     "encode_precheck_batch_ext_reply",
     "encode_download_unreadable",
     "encode_formatted_errors",

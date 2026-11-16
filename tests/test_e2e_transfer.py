@@ -107,6 +107,7 @@ def test_e2e_single_file_upload_and_download(dual_host_setup):
     # Upload A -> B
     success = transfer_a.upload_file(str(src_file_a), "C:\\uploaded.bin")
     assert success is True
+    dual_host_setup["session_b"].wait_settled(quiet_interval_s=0.05, timeout_s=2.0, min_settle_s=0.02)
 
     # Verify file arrived on Host B
     dest_file_b = dir_b / "uploaded.bin"
@@ -142,6 +143,7 @@ def test_e2e_batch_upload_and_download(dual_host_setup):
     # Batch Upload A -> B
     success = transfer_a.upload_batch([str(batch_dir)], "C:\\target_project")
     assert success is True
+    dual_host_setup["session_b"].wait_settled(quiet_interval_s=0.05, timeout_s=2.0, min_settle_s=0.02)
 
     # Verify structure on Host B
     b_proj = dir_b / "target_project" / "my_project"
@@ -249,6 +251,7 @@ def test_e2e_single_file_upload_conflict(dual_host_setup):
     # Upload with overwrite=True should succeed
     success = transfer_a.upload_file(str(src), "C:\\conflict.txt", overwrite=True)
     assert success is True
+    dual_host_setup["session_b"].wait_settled(quiet_interval_s=0.05, timeout_s=2.0, min_settle_s=0.02)
     assert existing_b.read_text() == "New content from A"
 
 
@@ -300,3 +303,85 @@ def test_e2e_download_missing_file_raises_filenotfound(dual_host_setup):
     with pytest.raises(FileNotFoundError, match="Download failed on peer with Win32 error 2"):
         transfer_a.download_file("C:\\does_not_exist.dat", str(dest_a))
     assert not dest_a.exists()
+
+
+def test_upload_streams_chunks_without_waiting_for_replies(tmp_path):
+    """Verify 0x0A awaits 0xA1, while 0x0C chunks and 0x0E are sent asynchronously via send_packet."""
+    from unittest.mock import MagicMock
+
+    from openeasysync.constants import OP_FILE_CHUNK, OP_TRANSFER_COMPLETE, OP_UPLOAD_SINGLE
+    from openeasysync.protocol.replies import encode_status_ack
+
+    src = tmp_path / "stream_test.bin"
+    src.write_bytes(b"A" * 130000)  # 3 chunks at 64000 bytes
+
+    mock_session = MagicMock()
+    mock_session.send_command.return_value = encode_status_ack(status=0, req_opcode=OP_UPLOAD_SINGLE, req_id=1)
+    transfer = TransferManager(mock_session)
+
+    assert transfer.upload_file(str(src), "C:\\stream_test.bin", overwrite=True) is True
+
+    # Only 0x0A should use send_command
+    assert mock_session.send_command.call_count == 1
+    assert mock_session.send_command.call_args.args[0][0] == OP_UPLOAD_SINGLE
+
+    # 3 chunks (0x0C) + 1 completion (0x0E) sent via send_packet
+    sent_opcodes = [call.args[0][0] for call in mock_session.send_packet.call_args_list]
+    assert sent_opcodes == [OP_FILE_CHUNK, OP_FILE_CHUNK, OP_FILE_CHUNK, OP_TRANSFER_COMPLETE]
+    mock_session.flush_tx.assert_called_once()
+
+
+def test_session_catches_async_0xa5_and_0xa9_and_aborts_upload(tmp_path):
+    """Verify SessionManager catches async 0xA5 and 0xA9 replies and aborts the upload pipeline."""
+    from unittest.mock import MagicMock
+
+    from openeasysync.constants import OP_FILE_CHUNK, OP_TRANSFER_COMPLETE, OP_UPLOAD_SINGLE
+    from openeasysync.protocol.replies import (
+        encode_status_ack,
+        encode_upload_batch_error,
+        encode_upload_error,
+    )
+
+    transport = MagicMock()
+    session = SessionManager(transport)
+    transfer = TransferManager(session)
+
+    src = tmp_path / "abort_test.bin"
+    src.write_bytes(b"B" * 130000)  # 3 chunks
+
+    # 1. Single-file upload error 0xA5 arriving after chunk 1
+    session.send_command = MagicMock(
+        return_value=encode_status_ack(status=0, req_opcode=OP_UPLOAD_SINGLE, req_id=1)
+    )
+    sent_packets: list[bytes] = []
+
+    def _fake_send_packet_a5(pkt: bytes) -> None:
+        sent_packets.append(pkt)
+        if pkt[0] == OP_FILE_CHUNK and len(sent_packets) == 1:
+            session._route_message(encode_upload_error(item_id=1, win32_error=112))
+
+    session.send_packet = _fake_send_packet_a5  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="Upload write error"):
+        transfer.upload_file(str(src), "C:\\abort_test.bin", overwrite=True)
+
+    # Pipeline aborted after chunk 1; 0x0E was never sent
+    assert len(sent_packets) == 1
+    assert sent_packets[0][0] == OP_FILE_CHUNK
+    assert all(p[0] != OP_TRANSFER_COMPLETE for p in sent_packets)
+
+    # 2. Batch upload error 0xA9 arriving after chunk 1
+    sent_packets.clear()
+
+    def _fake_send_packet_a9(pkt: bytes) -> None:
+        sent_packets.append(pkt)
+        if pkt[0] == OP_FILE_CHUNK and len(sent_packets) == 1:
+            session._route_message(encode_upload_batch_error(win32_error=112, failed_path="C:\\abort_test.bin"))
+
+    session.send_packet = _fake_send_packet_a9  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="Batch upload write error"):
+        transfer.upload_file(str(src), "C:\\abort_test.bin", overwrite=True)
+
+    assert len(sent_packets) == 1
+    assert sent_packets[0][0] == OP_FILE_CHUNK

@@ -29,7 +29,6 @@ from openeasysync.constants import (
     OP_VERIFY_PEER_NAME,
     OP_VNIC_SWITCH,
     OP_XML_CONTROL,
-    REPLY_CHUNK_ACK,
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
@@ -40,6 +39,7 @@ from openeasysync.constants import (
     REPLY_PRECHECK_BATCH_EXT,
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
+    REPLY_UPLOAD_ERROR,
     STATUS_ERROR,
     STATUS_INLINE_SMALL_FILE,
     STATUS_OK,
@@ -78,7 +78,6 @@ from openeasysync.protocol.replies import (
     BatchDownloadStreamRecord,
     BatchPrecheckExtConflict,
     decode_reply,
-    encode_chunk_ack,
     encode_download_batch_done,
     encode_download_batch_empty,
     encode_download_batch_stream,
@@ -89,6 +88,7 @@ from openeasysync.protocol.replies import (
     encode_precheck_batch_reply,
     encode_roots_reply,
     encode_status_ack,
+    encode_upload_error,
 )
 from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
 from openeasysync.server.handler import PeerServerHandler
@@ -180,13 +180,13 @@ def test_command_encoders_and_decoders():
     assert c0c["total_chunks"] == 3
     assert c0c["chunk_data"] == b"chunk data"
 
-    # 0xA5 Upload File Data Chunk ACK
-    raw_a5_ack = encode_chunk_ack(item_id=1, chunk_index=1)
-    assert len(raw_a5_ack) == 9
-    r_a5_ack = decode_reply(raw_a5_ack)
-    assert r_a5_ack["opcode"] == REPLY_CHUNK_ACK
-    assert r_a5_ack["item_id"] == 1
-    assert r_a5_ack["chunk_index"] == 1
+    # 0xA5 Single-File Upload Error Notification
+    raw_a5_err = encode_upload_error(item_id=1, win32_error=112)
+    assert len(raw_a5_err) == 9
+    r_a5_err = decode_reply(raw_a5_err)
+    assert r_a5_err["opcode"] == REPLY_UPLOAD_ERROR
+    assert r_a5_err["item_id"] == 1
+    assert r_a5_err["win32_error"] == 112
 
     # 0x0E Acknowledge File Transfer Completion
     raw0e = encode_transfer_complete(item_id=1, status=0)
@@ -428,23 +428,29 @@ def test_upload_protocol_wire_framing_and_server(tmp_path):
     assert len(replies_ow) == 1
     assert replies_ow[0][2] == 0
 
-    # 4. Stream 0x0C chunk -> returns 9-byte 0xA5 ACK
+    # 4. Stream 0x0C chunk -> unacknowledged on success (returns no replies)
     chunk_data = b"Hello World"
     cmd_chunk = encode_file_chunk(item_id=12, chunk_index=1, total_chunks=1, chunk_data=chunk_data)
     replies_chunk = handler.handle_command(cmd_chunk)
-    assert len(replies_chunk) == 1
-    assert len(replies_chunk[0]) == 9
-    assert replies_chunk[0][0] == 0xA5
-    dec_ack = decode_reply(replies_chunk[0])
-    assert dec_ack["opcode"] == 0xA5
-    assert dec_ack["item_id"] == 12
-    assert dec_ack["chunk_index"] == 1
+    assert replies_chunk == []
 
-    # 5. Finalize via 0x0E -> closes handle, returns no replies
+    # 5. Finalize via 0x0E -> returns no replies
     cmd_fin = encode_transfer_complete(item_id=12, status=0)
     replies_fin = handler.handle_command(cmd_fin)
     assert replies_fin == []
     assert (tmp_path / "file.txt").read_bytes() == b"Hello World"
+
+    # 6. Write error on unknown/closed item_id -> emits 9-byte 0xA5 error notification
+    err_replies = handler.handle_command(
+        encode_file_chunk(item_id=999, chunk_index=1, total_chunks=1, chunk_data=b"fail")
+    )
+    assert len(err_replies) == 1
+    assert len(err_replies[0]) == 9
+    assert err_replies[0][0] == 0xA5
+    dec_err = decode_reply(err_replies[0])
+    assert dec_err["opcode"] == 0xA5
+    assert dec_err["item_id"] == 999
+    assert dec_err["win32_error"] == 6
 
 
 def test_download_protocol_wire_framing_and_server(tmp_path):

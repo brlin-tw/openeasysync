@@ -9,7 +9,6 @@ from typing import Any
 
 from openeasysync.constants import (
     DIR_ENTRY_SIZE,
-    REPLY_CHUNK_ACK,
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_BATCH_STREAM,
@@ -23,6 +22,7 @@ from openeasysync.constants import (
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
     REPLY_UPLOAD_BATCH_ERROR,
+    REPLY_UPLOAD_ERROR,
     STATUS_ERROR,
     STATUS_OK,
     WIN32_FIND_DATA_SIZE,
@@ -127,12 +127,17 @@ def encode_status_ack(
     return header + file_data
 
 
-def encode_chunk_ack(item_id: int, chunk_index: int) -> bytes:
-    """Opcode 0xA5: Upload File Data Chunk ACK (9 bytes).
+def encode_upload_error(item_id: int, win32_error: int) -> bytes:
+    """Opcode 0xA5: Single-File Upload Error Notification (9 bytes).
 
-    Framing: [0xA5][item_id:u32_le][chunk_index:u32_le] (Section 4.2.6).
+    Framing: [0xA5][item_id:u32_le][win32_error:u32_le] (Section 4.2.6).
     """
-    return struct.pack("<BII", REPLY_CHUNK_ACK, item_id & 0xFFFFFFFF, chunk_index & 0xFFFFFFFF)
+    return struct.pack("<BII", REPLY_UPLOAD_ERROR, item_id & 0xFFFFFFFF, win32_error & 0xFFFFFFFF)
+
+
+def encode_chunk_ack(item_id: int, chunk_index: int) -> bytes:
+    """Deprecated alias for encode_upload_error (0xA5 is an error notification)."""
+    return encode_upload_error(item_id=item_id, win32_error=chunk_index)
 
 
 def encode_error_code(win32_error: int, req_opcode: int = 0, req_id: int = 0) -> bytes:
@@ -385,13 +390,13 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             "file_data": file_data,
         }
 
-    if opcode in (REPLY_CHUNK_ACK, REPLY_DOWNLOAD_BATCH_STREAM):
+    if opcode in (REPLY_UPLOAD_ERROR, REPLY_DOWNLOAD_BATCH_STREAM):
         if len(payload) == 9:
-            item_id, chunk_index = struct.unpack_from("<II", payload, 1)
+            item_id, win32_error = struct.unpack_from("<II", payload, 1)
             return {
-                "opcode": REPLY_CHUNK_ACK,
+                "opcode": REPLY_UPLOAD_ERROR,
                 "item_id": item_id,
-                "chunk_index": chunk_index,
+                "win32_error": win32_error,
             }
         count = struct.unpack_from("<I", payload, 1)[0]
         records: list[BatchDownloadStreamRecord] = []
