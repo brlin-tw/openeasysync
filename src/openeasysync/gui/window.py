@@ -414,9 +414,9 @@ class MainWindow(QMainWindow):
             if entry.is_dir:
                 self.transfer.upload_batch([src_path], self.remote_current_path or "C:\\")
             else:
-                # Precheck
-                if self.transfer.precheck_single(dest_remote):
-                    # Show confirm
+                try:
+                    self.transfer.upload_file(src_path, dest_remote, overwrite=False)
+                except FileExistsError:
                     dlg = ConfirmReplaceDialog(
                         filename=entry.find_data.filename,
                         existing_size=entry.find_data.file_size,
@@ -428,8 +428,7 @@ class MainWindow(QMainWindow):
                     res = dlg.exec()
                     if res in (0, -1):
                         return
-
-                self.transfer.upload_file(src_path, dest_remote)
+                    self.transfer.upload_file(src_path, dest_remote, overwrite=True)
             self.refresh_remote()
             self.statusBar().showMessage("Upload completed.", 3000)
         except Exception as exc:

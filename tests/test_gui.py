@@ -129,3 +129,63 @@ def test_main_window_up_button_focused_pane(qapp, tmp_path):
 
     win.close()
     win.deleteLater()
+
+
+def test_main_window_upload_uses_inline_overwrite_check(qapp, tmp_path, monkeypatch):
+    """Verify Copy -> uses Opcode 0x0A inline overwrite check instead of Opcode 0x0F precheck."""
+    from unittest.mock import MagicMock
+
+    local_file = tmp_path / "sample.txt"
+    local_file.write_text("hello", encoding="utf-8")
+
+    cable = MockBridgeCable()
+    t_a, _ = cable.create_pair()
+    session = SessionManager(t_a)
+    monkeypatch.setattr(SessionManager, "is_connected", property(lambda self: True))
+
+    win = MainWindow(session=session)
+    win.local_current_path = str(tmp_path)
+    win.remote_current_path = "C:\\Dest"
+    win.refresh_local()
+    win.local_pane.table.setCurrentCell(0, 0)
+
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "information",
+        MagicMock(side_effect=AssertionError("Unexpected QMessageBox.information")),
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        MagicMock(side_effect=AssertionError("Unexpected QMessageBox.warning")),
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "critical",
+        MagicMock(side_effect=AssertionError("Unexpected QMessageBox.critical")),
+    )
+
+    win.transfer.precheck_single = MagicMock(side_effect=AssertionError("precheck_single must not be called"))
+    win.refresh_remote = MagicMock()
+
+    # Case 1: New file succeeds on first upload_file(..., overwrite=False)
+    win.transfer.upload_file = MagicMock(return_value=True)
+    win._on_upload_clicked()
+    win.transfer.upload_file.assert_called_once_with(str(local_file), "C:\\Dest\\sample.txt", overwrite=False)
+
+    # Case 2: Existing file raises FileExistsError, user confirms replacement -> overwrite=True
+    win.transfer.upload_file = MagicMock(side_effect=[FileExistsError("exists"), True])
+    monkeypatch.setattr(ConfirmReplaceDialog, "exec", lambda self: 1)
+    win._on_upload_clicked()
+    assert win.transfer.upload_file.call_count == 2
+    assert win.transfer.upload_file.call_args_list[0].kwargs == {"overwrite": False}
+    assert win.transfer.upload_file.call_args_list[1].kwargs == {"overwrite": True}
+
+    # Case 3: Existing file raises FileExistsError, user cancels -> no second upload_file call
+    win.transfer.upload_file = MagicMock(side_effect=FileExistsError("exists"))
+    monkeypatch.setattr(ConfirmReplaceDialog, "exec", lambda self: 0)
+    win._on_upload_clicked()
+    win.transfer.upload_file.assert_called_once_with(str(local_file), "C:\\Dest\\sample.txt", overwrite=False)
+
+    win.close()
+    win.deleteLater()
