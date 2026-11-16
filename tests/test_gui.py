@@ -189,3 +189,72 @@ def test_main_window_upload_uses_inline_overwrite_check(qapp, tmp_path, monkeypa
 
     win.close()
     win.deleteLater()
+
+
+def test_main_window_delete_button_focused_pane(qapp, tmp_path, monkeypatch):
+    """Verify MainWindow Delete action operates only on the currently focused pane."""
+    from unittest.mock import MagicMock
+
+    local_file = tmp_path / "local.txt"
+    local_file.write_text("local", encoding="utf-8")
+
+    cable = MockBridgeCable()
+    t_a, _ = cable.create_pair()
+    session = SessionManager(t_a)
+    monkeypatch.setattr(SessionManager, "is_connected", property(lambda self: True))
+
+    win = MainWindow(session=session)
+    win.show()
+    win.local_current_path = str(tmp_path)
+    win.remote_current_path = "C:\\Remote"
+    win.refresh_local()
+    win.remote_pane.set_entries(
+        "C:\\Remote",
+        [
+            make_file_entry("remote.txt", size=12, is_dir=False),
+            make_file_entry("remote_dir", size=0, is_dir=True),
+        ],
+    )
+    win.local_pane.table.setCurrentCell(0, 0)
+    win.remote_pane.table.setCurrentCell(0, 0)
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", lambda *args, **kwargs: QtWidgets.QMessageBox.Yes)
+    warn_mock = MagicMock()
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", warn_mock)
+
+    win.transfer.delete_file = MagicMock(return_value=True)
+    win.transfer.delete_dir = MagicMock(return_value=True)
+    win.refresh_remote = MagicMock()
+
+    # 1. Focus remote pane: Delete should delete remote file, not local file
+    win.remote_pane.table.setFocus()
+    qapp.processEvents()
+    assert win._get_focused_pane() is win.remote_pane
+
+    win.act_delete.trigger()
+    win.transfer.delete_file.assert_called_once_with("C:\\Remote\\remote.txt")
+    win.transfer.delete_dir.assert_not_called()
+    win.refresh_remote.assert_called_once()
+    assert local_file.exists()
+
+    # 2. Focus remote pane on a directory: Delete should call delete_dir
+    win.remote_pane.table.setCurrentCell(1, 0)
+    win.act_delete.trigger()
+    win.transfer.delete_dir.assert_called_once_with("C:\\Remote\\remote_dir")
+    assert local_file.exists()
+
+    # 3. Focus local pane: Delete should delete local file, not remote
+    win.transfer.delete_file.reset_mock()
+    win.transfer.delete_dir.reset_mock()
+    win.local_pane.table.setFocus()
+    qapp.processEvents()
+    assert win._get_focused_pane() is win.local_pane
+
+    win.act_delete.trigger()
+    assert not local_file.exists()
+    win.transfer.delete_file.assert_not_called()
+    win.transfer.delete_dir.assert_not_called()
+    warn_mock.assert_not_called()
+
+    win.close()
+    win.deleteLater()

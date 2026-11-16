@@ -461,25 +461,72 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Download Failed", str(exc))
 
-    def _on_delete_clicked(self) -> None:
-        # Check active pane
-        loc_entry = self.local_pane.get_selected_entry()
-        if loc_entry:
-            path = os.path.join(self.local_current_path, loc_entry.find_data.filename)
-            reply = QMessageBox.question(
-                self, "Delete", f"Are you sure you want to delete '{loc_entry.find_data.filename}'?"
-            )
-            if reply == QMessageBox.Yes:
-                try:
-                    if loc_entry.is_dir:
-                        import shutil
+    def _build_remote_path(self, filename: str) -> str:
+        """Joins filename onto remote_current_path using the remote path style."""
+        if "\\" in self.remote_current_path or ":" in self.remote_current_path:
+            return ntpath.join(self.remote_current_path, filename)
+        if self.remote_current_path:
+            return posixpath.join(self.remote_current_path, filename)
+        return f"C:\\{filename}"
 
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
-                    self.refresh_local()
-                except Exception as exc:
-                    QMessageBox.warning(self, "Delete Error", str(exc))
+    def _on_delete_clicked(self) -> None:
+        focused = self._get_focused_pane()
+        if focused is self.local_pane:
+            self._delete_local_selected()
+        elif focused is self.remote_pane:
+            self._delete_remote_selected()
+
+    def _delete_local_selected(self) -> None:
+        loc_entry = self.local_pane.get_selected_entry()
+        if not loc_entry:
+            return
+        path = os.path.join(self.local_current_path, loc_entry.find_data.filename)
+        reply = QMessageBox.question(
+            self, "Delete", f"Are you sure you want to delete '{loc_entry.find_data.filename}'?"
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            if loc_entry.is_dir:
+                import shutil
+
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            self.refresh_local()
+        except Exception as exc:
+            QMessageBox.warning(self, "Delete Error", str(exc))
+
+    def _delete_remote_selected(self) -> None:
+        rem_entry = self.remote_pane.get_selected_entry()
+        if not rem_entry:
+            return
+        if rem_entry.is_drive:
+            QMessageBox.warning(self, "Delete Error", "Cannot delete a drive.")
+            return
+        if not self.transfer or not self.session or not self.session.is_connected:
+            QMessageBox.warning(self, "Delete Error", "Remote peer is not connected.")
+            return
+
+        remote_path = self._build_remote_path(rem_entry.find_data.filename)
+        reply = QMessageBox.question(
+            self, "Delete", f"Are you sure you want to delete '{rem_entry.find_data.filename}'?"
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            if rem_entry.is_dir:
+                ok = self.transfer.delete_dir(remote_path)
+            else:
+                ok = self.transfer.delete_file(remote_path)
+            if ok:
+                self.refresh_remote()
+            else:
+                QMessageBox.warning(
+                    self, "Delete Error", f"Failed to delete '{rem_entry.find_data.filename}'."
+                )
+        except Exception as exc:
+            QMessageBox.warning(self, "Delete Error", str(exc))
 
     def _on_mkdir_clicked(self) -> None:
         name, ok = QInputDialog.getText(self, "New Folder", "Enter folder name:")
