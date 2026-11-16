@@ -67,6 +67,9 @@ openeasysync put ./my_folder "C:\my_folder"
 
 # Download a file or directory from remote peer
 openeasysync get "C:\remote_file.txt" ./downloaded_file.txt
+
+# Delete a file on remote peer
+openeasysync rm "C:\remote_file.txt"
 ```
 
 ### Graphical User Interface (GUI)

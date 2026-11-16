@@ -209,6 +209,35 @@ def cmd_get(args) -> int:
         session.disconnect()
 
 
+def cmd_rm(args) -> int:
+    """Deletes a file on the remote peer."""
+    device_spec = getattr(args, "device", None)
+    transport = detect_device(device_spec)
+    if not transport:
+        print("Error: No available OTi-2108 device detected.", file=sys.stderr)
+        return 1
+
+    session = SessionManager(transport)
+    session.connect()
+    transfer = TransferManager(session)
+
+    try:
+        remote_p = args.remote_path
+        print(f"Deleting '{remote_p}'...")
+        success = transfer.delete_file(remote_p)
+        if success:
+            print("File deleted successfully.")
+            return 0
+        else:
+            print(f"Failed to delete '{remote_p}'.", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        session.disconnect()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="openeasysync",
@@ -262,6 +291,13 @@ def main(argv: list[str] | None = None) -> int:
     p_get.add_argument("remote_path", help="Remote source path")
     p_get.add_argument("local_path", help="Local destination path")
     p_get.set_defaults(func=cmd_get)
+
+    # rm
+    p_rm = subparsers.add_parser(
+        "rm", aliases=["delete"], help="Delete a file on remote peer"
+    )
+    p_rm.add_argument("remote_path", help="Remote file path to delete")
+    p_rm.set_defaults(func=cmd_rm)
 
     parsed_args = parser.parse_args(argv)
     if parsed_args.debug:
