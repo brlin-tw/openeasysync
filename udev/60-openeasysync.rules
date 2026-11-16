@@ -1,0 +1,16 @@
+# Copyright 2026 林博仁(Buo-ren Lin) <buo.ren.lin@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Grant the active seat user read/write access to OTi-2108 USB Host-to-Host
+# Data Bridge devices (0ea0:2108) via systemd-logind uaccess ACLs.
+# Must be ordered before 71-seat.rules and 73-seat-late.rules.
+
+ACTION=="remove", GOTO="openeasysync_rules_end"
+
+# Direct USB device node (/dev/bus/usb/<bus>/<dev>) for PyUSB / libusb backend
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0ea0", ATTR{idProduct}=="2108", TAG+="uaccess"
+
+# SCSI generic device node (/dev/sg*) for Linux SG_IO pass-through backend
+SUBSYSTEM=="scsi_generic", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0ea0", ATTRS{idProduct}=="2108", TAG+="uaccess"
+
+LABEL="openeasysync_rules_end"

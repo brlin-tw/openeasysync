@@ -35,6 +35,17 @@ source .venv/bin/activate
 pip install -e .[gui,dev]
 ```
 
+### Linux Permissions (udev)
+
+On Linux, install the provided udev rule so non-root users on the active login seat are granted read/write access to OTi-2108 (`0ea0:2108`) USB and SCSI generic (`/dev/sg*`) device nodes via `systemd-logind` `uaccess` ACLs:
+
+```bash
+sudo cp udev/60-openeasysync.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=0ea0 --attr-match=idProduct=2108
+sudo udevadm trigger --subsystem-match=scsi_generic
+```
+
 ## Usage
 
 ### Command-Line Interface (CLI)
