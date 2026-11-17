@@ -346,7 +346,13 @@ class SessionManager:
 
         self._last_rx_time = time.time()
         opcode = message[0]
-        logger.debug("Received complete wire message: opcode=%#04x, len=%d", opcode, len(message))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Received complete wire message: opcode=%#04x, len=%d, hex=%s",
+                opcode,
+                len(message),
+                message[:128].hex(),
+            )
 
         # 1. Server Reply (0xA1..0xAC) -> routes to client waiting thread
         if 0xA1 <= opcode <= 0xAC:
@@ -376,5 +382,13 @@ class SessionManager:
         replies = self.server_handler.handle_command(message)
         for rep in replies:
             reply_blocks = self.splitter.split_message(rep)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Enqueuing server reply: opcode=%#04x, len=%d, blocks=%d, hex=%s",
+                    rep[0] if rep else 0,
+                    len(rep),
+                    len(reply_blocks),
+                    rep[:128].hex(),
+                )
             for b in reply_blocks:
                 self.poller.enqueue_tx(b)
