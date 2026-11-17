@@ -5,6 +5,7 @@
 import ctypes
 import fcntl
 import os
+import threading
 from typing import Literal
 
 from openeasysync.transport.base import TransportBackend
@@ -47,6 +48,7 @@ class LinuxSgIoTransport(TransportBackend):
 
     def __init__(self, device_path: str):
         self.device_path = device_path
+        self._io_lock = threading.RLock()
         self.fd = os.open(device_path, os.O_RDWR | os.O_NONBLOCK)
         self._has_lock = False
         try:
@@ -100,7 +102,8 @@ class LinuxSgIoTransport(TransportBackend):
         hdr.sbp = ctypes.cast(sense_buf, ctypes.c_void_p)
         hdr.timeout = timeout_ms
 
-        fcntl.ioctl(self.fd, SG_IO, hdr)
+        with self._io_lock:
+            fcntl.ioctl(self.fd, SG_IO, hdr)
 
         sense = (0, 0, 0)
         if hdr.sb_len_wr > 0:

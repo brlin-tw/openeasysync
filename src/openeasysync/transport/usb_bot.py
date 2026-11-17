@@ -3,6 +3,7 @@
 """Direct USB Bulk-Only Transport (BOT) backend for OTi-2108 using PyUSB / libusb."""
 
 import struct
+import threading
 from typing import Literal
 
 from openeasysync.constants import (
@@ -68,6 +69,7 @@ class PyUsbTransport(TransportBackend):
 
         self.dev = dev
         self._tag = OTI_CBW_TAG
+        self._io_lock = threading.RLock()
 
         # Detach OS driver if bound
         try:
@@ -132,6 +134,23 @@ class PyUsbTransport(TransportBackend):
             pass
 
     def execute_cdb(
+        self,
+        cdb: bytes,
+        direction: Literal["NONE", "IN", "OUT"],
+        data_or_length: bytes | int = 0,
+        timeout_ms: int = 5000,
+        tag: int = OTI_CBW_TAG,
+    ) -> tuple[int, bytes, tuple[int, int, int]]:
+        with self._io_lock:
+            return self._execute_cdb_locked(
+                cdb=cdb,
+                direction=direction,
+                data_or_length=data_or_length,
+                timeout_ms=timeout_ms,
+                tag=tag,
+            )
+
+    def _execute_cdb_locked(
         self,
         cdb: bytes,
         direction: Literal["NONE", "IN", "OUT"],
