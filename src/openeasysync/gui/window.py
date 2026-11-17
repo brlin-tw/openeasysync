@@ -183,7 +183,7 @@ class MainWindow(QMainWindow):
         self.lamp_timer.start(1000)
 
         # Initial directory load
-        self.local_current_path = os.path.expanduser("~")
+        self.local_current_path = os.getcwd()
         self.remote_current_path = ""
         self.refresh_local()
         self.refresh_remote()

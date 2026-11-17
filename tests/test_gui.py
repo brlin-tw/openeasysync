@@ -258,3 +258,14 @@ def test_main_window_delete_button_focused_pane(qapp, tmp_path, monkeypatch):
 
     win.close()
     win.deleteLater()
+
+
+def test_main_window_local_pane_defaults_to_cwd(qapp, tmp_path, monkeypatch):
+    """Verify MainWindow opens the current working directory in the local pane by default."""
+    monkeypatch.chdir(tmp_path)
+    win = MainWindow()
+    assert win.local_current_path == str(tmp_path)
+    assert win.local_pane.current_path == str(tmp_path)
+    assert win.local_pane.lbl_path.text() == str(tmp_path)
+    win.close()
+    win.deleteLater()
