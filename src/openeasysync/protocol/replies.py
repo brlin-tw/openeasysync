@@ -4,16 +4,13 @@
 
 import struct
 import sys
-from dataclasses import dataclass
 from typing import Any
 
 from openeasysync.constants import (
     DIR_ENTRY_SIZE,
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
-    REPLY_DOWNLOAD_BATCH_STREAM,
     REPLY_DOWNLOAD_CHUNK,
-    REPLY_DOWNLOAD_SINGLE,
     REPLY_DOWNLOAD_UNREADABLE,
     REPLY_FORMATTED_ERROR,
     REPLY_LISTING,
@@ -25,30 +22,10 @@ from openeasysync.constants import (
     REPLY_UPLOAD_ERROR,
     STATUS_ERROR,
     STATUS_OK,
-    WIN32_FIND_DATA_SIZE,
 )
-from openeasysync.protocol.directory_entry import Entry552, Win32FindData
+from openeasysync.protocol.directory_entry import Entry552
 
-
-@dataclass
-class BatchDownloadStreamRecord:
-    rel_path: str
-    find_data: Win32FindData
-    data: bytes = b""
-
-
-@dataclass
-class BatchDownloadEmptyRecord:
-    rel_path: str
-    find_data: Win32FindData
-
-
-@dataclass
-class BatchPrecheckExtConflict:
-    rel_path: str
-    peer_find_data: Win32FindData
-    src_find_data: Win32FindData
-
+_ERRSTR_MARKER = b"ErrStr"
 
 WIN32_ERROR_MESSAGES: dict[int, str] = {
     0: "The operation completed successfully.",
@@ -99,13 +76,7 @@ def encode_status_ack(
     flags: int = 0,
     file_data: bytes = b"",
 ) -> bytes:
-    """Opcode 0xA1: Command Status / ACK (24-byte structured response header + optional inline data).
-
-    Framing:
-    [0xA1][req_opcode:u8][status:u8][req_id:u32_le][win32_error:u32_le]
-    [file_size_low:u32_le][file_size_high:u32_le][flags:u8][data_len:u32_le][file_data:bytes]
-    Total header size: 24 bytes (0x18). Total packet size: 24 + len(file_data) bytes.
-    """
+    """Opcode 0xA1: Command Status / ACK (24-byte structured response header + optional inline data)."""
     data_len = len(file_data)
     effective_file_size = file_size if file_size else data_len
     file_size_low = effective_file_size & 0xFFFFFFFF
@@ -128,25 +99,12 @@ def encode_status_ack(
 
 
 def encode_upload_error(item_id: int, win32_error: int) -> bytes:
-    """Opcode 0xA5: Single-File Upload Error Notification (9 bytes).
-
-    Framing: [0xA5][item_id:u32_le][win32_error:u32_le] (Section 4.2.6).
-    """
+    """Opcode 0xA5: Single-File Upload Error Notification (9 bytes)."""
     return struct.pack("<BII", REPLY_UPLOAD_ERROR, item_id & 0xFFFFFFFF, win32_error & 0xFFFFFFFF)
 
 
-def encode_chunk_ack(item_id: int, chunk_index: int) -> bytes:
-    """Deprecated alias for encode_upload_error (0xA5 is an error notification)."""
-    return encode_upload_error(item_id=item_id, win32_error=chunk_index)
-
-
 def encode_error_code(win32_error: int, req_opcode: int = 0, req_id: int = 0) -> bytes:
-    """Encodes an error reply using the 24-byte 0xA1 structured response.
-
-    Note: Opcode 0xA2 is reserved strictly for Directory Listings (Entry552).
-    Emitting a short error reply with opcode 0xA2 is a protocol violation that
-    causes peer memory corruption. Error replies MUST use 0xA1 with status=1.
-    """
+    """Encodes an error reply using the 24-byte 0xA1 structured response."""
     return encode_status_ack(
         status=STATUS_ERROR,
         req_opcode=req_opcode,
@@ -156,11 +114,7 @@ def encode_error_code(win32_error: int, req_opcode: int = 0, req_id: int = 0) ->
 
 
 def encode_listing_reply(entries: list[Entry552], encoding: str = "utf-16le") -> bytes:
-    """Opcode 0xA2: Directory Listing Reply.
-
-    Framing: [0xA2][entry_count:uint16_le][entries: Entry552[entry_count]]
-    Total length = 3 + 552 * entry_count bytes.
-    """
+    """Opcode 0xA2: Directory Listing Reply."""
     body = bytearray([REPLY_LISTING])
     body.extend(struct.pack("<H", len(entries)))
     for e in entries:
@@ -176,7 +130,7 @@ def encode_download_chunk(
 ) -> bytes:
     """Opcode 0xA3: File Download Data Chunk."""
     header = bytes([REPLY_DOWNLOAD_CHUNK]) + struct.pack(
-        "<IIII", item_id, chunk_index, total_chunks, len(chunk_data)
+        "<IIII", item_id & 0xFFFFFFFF, chunk_index, total_chunks, len(chunk_data)
     )
     return header + chunk_data
 
@@ -191,105 +145,145 @@ def encode_roots_reply(drives: list[tuple[str, int]]) -> bytes:
     return bytes(body)
 
 
-def encode_download_single_reply(
-    find_data: Win32FindData,
-    file_data: bytes,
-    encoding: str = "utf-8",
-) -> bytes:
-    """Opcode 0xA4: Single File Download Data Reply."""
-    fd_b = find_data.pack(encoding=encoding)
-    header = bytes([REPLY_DOWNLOAD_SINGLE]) + struct.pack("<I", len(file_data)) + fd_b
-    return header + file_data
+def _encode_req_item_ids(opcode: int, req_id: int, item_ids: list[int]) -> bytes:
+    """Packs [opcode:u8][req_id:u32_le][count:u16_le][item_ids:u32_le[count]] for 0xA6/0xAB."""
+    header = struct.pack("<BIH", opcode, req_id & 0xFFFFFFFF, len(item_ids) & 0xFFFF)
+    if not item_ids:
+        return header
+    return header + struct.pack(f"<{len(item_ids)}I", *(i & 0xFFFFFFFF for i in item_ids))
 
 
-def encode_download_batch_stream(
-    records: list[BatchDownloadStreamRecord],
-    encoding: str = "utf-8",
-) -> bytes:
-    """Opcode 0xA5: Batch File Download Stream Reply."""
-    body = bytearray([REPLY_DOWNLOAD_BATCH_STREAM])
-    body.extend(struct.pack("<I", len(records)))
-    for r in records:
-        pb = r.rel_path.encode(encoding, errors="replace")
-        fd_b = r.find_data.pack(encoding=encoding)
-        rec_hdr = struct.pack("<II", len(pb), len(r.data)) + fd_b + pb + r.data
-        body.extend(rec_hdr)
-    return bytes(body)
-
-
-def encode_download_batch_empty(
-    records: list[BatchDownloadEmptyRecord],
-    encoding: str = "utf-8",
-) -> bytes:
+def encode_download_batch_empty(item_ids: list[int], req_id: int = 1) -> bytes:
     """Opcode 0xA6: Batch Zero-Length Files / Empty Directories."""
-    body = bytearray([REPLY_DOWNLOAD_BATCH_EMPTY])
-    body.extend(struct.pack("<I", len(records)))
-    for r in records:
-        pb = r.rel_path.encode(encoding, errors="replace")
-        fd_b = r.find_data.pack(encoding=encoding)
-        body.extend(struct.pack("<I", len(pb)) + fd_b + pb)
-    return bytes(body)
+    return _encode_req_item_ids(REPLY_DOWNLOAD_BATCH_EMPTY, req_id, item_ids)
 
 
 def encode_download_batch_done(req_id: int = 0, status: int = 0) -> bytes:
     """Opcode 0xA7: Batch Download Complete ACK (7 bytes total)."""
-    return bytes([REPLY_DOWNLOAD_BATCH_DONE]) + struct.pack("<IH", req_id, status)
+    return bytes([REPLY_DOWNLOAD_BATCH_DONE]) + struct.pack("<IH", req_id & 0xFFFFFFFF, status & 0xFFFF)
 
 
-def encode_precheck_batch_reply(conflicts: list[str], encoding: str = "utf-8") -> bytes:
-    """Opcode 0xA8: Batch Upload Pre-Check Reply."""
-    body = bytearray([REPLY_PRECHECK_BATCH])
-    body.extend(struct.pack("<I", len(conflicts)))
-    for p in conflicts:
-        pb = p.encode(encoding, errors="replace")
-        body.extend(struct.pack("<I", len(pb)) + pb)
-    return bytes(body)
+def encode_precheck_batch_reply(
+    conflict_item_ids: list[int],
+    req_id: int = 1,
+    insufficient_space: bool = False,
+    has_conflicts: bool | None = None,
+    flag0: int = 0,
+    flag3: int = 0,
+) -> bytes:
+    """Opcode 0xA8: Batch Upload Pre-Check Reply.
+
+    Wire layout:
+    [0xA8][flag0:u8][insufficient_space:u8][has_conflicts:u8][flag3:u8]
+    [req_id:u32_le][conflict_count:u32_le][conflict_item_ids:u32_le[conflict_count]]
+    """
+    conflicts_flag = 1 if (has_conflicts if has_conflicts is not None else bool(conflict_item_ids)) else 0
+    header = struct.pack(
+        "<BBBBBII",
+        REPLY_PRECHECK_BATCH,
+        flag0 & 0xFF,
+        1 if insufficient_space else 0,
+        conflicts_flag,
+        flag3 & 0xFF,
+        req_id & 0xFFFFFFFF,
+        len(conflict_item_ids),
+    )
+    if not conflict_item_ids:
+        return header
+    return header + struct.pack(
+        f"<{len(conflict_item_ids)}I", *(i & 0xFFFFFFFF for i in conflict_item_ids)
+    )
 
 
 def encode_upload_batch_error(
-    win32_error: int, failed_path: str = "", encoding: str = "utf-8"
+    item_id: int,
+    win32_error: int,
+    status: int = 1,
+    err_str: str | None = None,
+    encoding: str = "utf-16le",
 ) -> bytes:
-    """Opcode 0xA9: Batch Upload Error Notification."""
-    pb = failed_path.encode(encoding, errors="replace")
-    return bytes([REPLY_UPLOAD_BATCH_ERROR]) + struct.pack("<II", win32_error, len(pb)) + pb
+    """Opcode 0xA9: Batch Upload Error Notification.
+
+    Wire layout: [0xA9][item_id:u32_le][win32_error:u32_le][status:u32_le]
+    (appends "ErrStr" + err_str_len:u32_le + err_str:wchar_t[] in 0x10 mode).
+    """
+    pkt = struct.pack(
+        "<BIII",
+        REPLY_UPLOAD_BATCH_ERROR,
+        item_id & 0xFFFFFFFF,
+        win32_error & 0xFFFFFFFF,
+        status & 0xFFFFFFFF,
+    )
+    if err_str is not None:
+        err_b = err_str.encode(encoding, errors="replace")
+        pkt += _ERRSTR_MARKER + struct.pack("<I", len(err_b)) + err_b
+    return pkt
 
 
 def encode_precheck_batch_ext_reply(
-    conflicts: list[BatchPrecheckExtConflict],
-    encoding: str = "utf-8",
+    conflict_item_ids: list[int],
+    req_id: int = 1,
+    extra_pairs: list[tuple[int, int]] | None = None,
+    flag0: int = 0,
+    flag1: int = 0,
+    flag2: int | None = None,
+    flag3: int = 0,
 ) -> bytes:
-    """Opcode 0xAA: Extended Batch Pre-Check Reply."""
-    body = bytearray([REPLY_PRECHECK_BATCH_EXT])
-    body.extend(struct.pack("<I", len(conflicts)))
-    for c in conflicts:
-        pb = c.rel_path.encode(encoding, errors="replace")
-        p_fd = c.peer_find_data.pack(encoding=encoding)
-        s_fd = c.src_find_data.pack(encoding=encoding)
-        body.extend(struct.pack("<I", len(pb)) + p_fd + s_fd + pb)
+    """Opcode 0xAA: Extended Batch Pre-Check Reply.
+
+    Wire layout:
+    [0xAA][flag0:u8][flag1:u8][flag2:u8][flag3:u8][req_id:u32_le]
+    [conflict_count:u32_le][extra_count:u32_le]
+    [conflict_item_ids:u32_le[conflict_count]][extra_pairs: (item_id:u32_le, val:u32_le)[extra_count]]
+    """
+    pairs = extra_pairs or []
+    eff_flag2 = (1 if conflict_item_ids else 0) if flag2 is None else flag2
+    body = bytearray(
+        struct.pack(
+            "<BBBBBIII",
+            REPLY_PRECHECK_BATCH_EXT,
+            flag0 & 0xFF,
+            flag1 & 0xFF,
+            eff_flag2 & 0xFF,
+            flag3 & 0xFF,
+            req_id & 0xFFFFFFFF,
+            len(conflict_item_ids),
+            len(pairs),
+        )
+    )
+    for item_id in conflict_item_ids:
+        body.extend(struct.pack("<I", item_id & 0xFFFFFFFF))
+    for item_id, val in pairs:
+        body.extend(struct.pack("<II", item_id & 0xFFFFFFFF, val & 0xFFFFFFFF))
     return bytes(body)
 
 
-def encode_download_unreadable(failures: list[tuple[str, int]], encoding: str = "utf-8") -> bytes:
+def encode_download_unreadable(item_ids: list[int], req_id: int = 1) -> bytes:
     """Opcode 0xAB: Batch Unreadable Files Notification."""
-    body = bytearray([REPLY_DOWNLOAD_UNREADABLE])
-    body.extend(struct.pack("<I", len(failures)))
-    for path, err in failures:
-        pb = path.encode(encoding, errors="replace")
-        body.extend(struct.pack("<II", len(pb), err) + pb)
-    return bytes(body)
+    return _encode_req_item_ids(REPLY_DOWNLOAD_UNREADABLE, req_id, item_ids)
 
 
-def encode_formatted_errors(errors: list[tuple[int, str]], encoding: str = "utf-8") -> bytes:
-    """Opcode 0xAC: Formatted Win32 Error Strings Reply."""
+def encode_formatted_errors(errors: list[tuple[int, str]], encoding: str = "utf-16le") -> bytes:
+    """Opcode 0xAC: Formatted Win32 Error Strings Reply (UTF-16LE)."""
     body = bytearray([REPLY_FORMATTED_ERROR])
     body.extend(struct.pack("<I", len(errors)))
     for err_code, msg in errors:
         mb = msg.encode(encoding, errors="replace")
-        body.extend(struct.pack("<II", err_code, len(mb)) + mb)
+        body.extend(struct.pack("<II", err_code & 0xFFFFFFFF, len(mb)) + mb)
     return bytes(body)
 
 
 # Decoders
+
+
+def _decode_req_item_ids(payload: bytes) -> tuple[int, list[int]]:
+    req_id, count = struct.unpack_from("<IH", payload, 1)
+    item_ids = [
+        struct.unpack_from("<I", payload, 7 + i * 4)[0]
+        for i in range(count)
+        if 7 + (i + 1) * 4 <= len(payload)
+    ]
+    return req_id, item_ids
 
 
 def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
@@ -335,7 +329,6 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         }
 
     if opcode == REPLY_LISTING:
-        # Opcode 0xA2: Directory Listing Reply with 16-bit entry_count
         if len(payload) >= 3:
             entry_count = struct.unpack_from("<H", payload, 1)[0]
             entries: list[Entry552] = []
@@ -343,14 +336,12 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             for _ in range(entry_count):
                 if offset + DIR_ENTRY_SIZE > len(payload):
                     break
-                entry_bytes = payload[offset : offset + DIR_ENTRY_SIZE]
-                entries.append(Entry552.unpack(entry_bytes, encoding=encoding))
+                entries.append(Entry552.unpack(payload[offset : offset + DIR_ENTRY_SIZE], encoding=encoding))
                 offset += DIR_ENTRY_SIZE
             return {"opcode": REPLY_LISTING, "entries": entries}
         return {"opcode": REPLY_LISTING, "entries": []}
 
     if opcode == REPLY_DOWNLOAD_CHUNK:
-        # Opcode 0xA3: File Download Data Chunk
         if len(payload) >= 17:
             item_id, chunk_index, total_chunks, data_len = struct.unpack_from("<IIII", payload, 1)
             chunk_data = payload[17 : 17 + data_len]
@@ -363,70 +354,30 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             }
         return {"opcode": opcode, "raw": payload}
 
-    if opcode in (REPLY_ROOTS, REPLY_DOWNLOAD_SINGLE):
-        # Distinguish between Root Drive Listing (0xA4) and Single File Download (0xA4):
-        # Root Drive Listing format from EasySuite.exe (0x004410a6 / 0x0040f093):
-        # [0xA4][drive_count:u16_le][(letter:u8, type:u8)...] -> max 55 bytes (26 drives)
-        if len(payload) >= 3:
-            drive_count = struct.unpack_from("<H", payload, 1)[0]
-            if drive_count <= 26 and len(payload) == 3 + drive_count * 2:
-                roots: list[tuple[str, int]] = []
-                offset = 3
-                for _ in range(drive_count):
-                    letter_char = chr(payload[offset])
-                    dtype = payload[offset + 1] & 0x0F
-                    roots.append((letter_char, dtype))
-                    offset += 2
-                return {"opcode": REPLY_ROOTS, "roots": roots}
+    if opcode == REPLY_ROOTS:
+        drive_count = struct.unpack_from("<H", payload, 1)[0]
+        roots: list[tuple[str, int]] = []
+        offset = 3
+        for _ in range(drive_count):
+            if offset + 2 > len(payload):
+                break
+            letter_char = chr(payload[offset])
+            dtype = payload[offset + 1] & 0x0F
+            roots.append((letter_char, dtype))
+            offset += 2
+        return {"opcode": REPLY_ROOTS, "roots": roots}
 
-        file_size = struct.unpack_from("<I", payload, 1)[0]
-        fd = Win32FindData.unpack(payload[5 : 5 + WIN32_FIND_DATA_SIZE], encoding=encoding)
-        data_start = 5 + WIN32_FIND_DATA_SIZE
-        file_data = payload[data_start : data_start + file_size]
+    if opcode == REPLY_UPLOAD_ERROR:
+        item_id, win32_error = struct.unpack_from("<II", payload, 1)
         return {
-            "opcode": REPLY_DOWNLOAD_SINGLE,
-            "file_size": file_size,
-            "find_data": fd,
-            "file_data": file_data,
+            "opcode": REPLY_UPLOAD_ERROR,
+            "item_id": item_id,
+            "win32_error": win32_error,
         }
 
-    if opcode in (REPLY_UPLOAD_ERROR, REPLY_DOWNLOAD_BATCH_STREAM):
-        if len(payload) == 9:
-            item_id, win32_error = struct.unpack_from("<II", payload, 1)
-            return {
-                "opcode": REPLY_UPLOAD_ERROR,
-                "item_id": item_id,
-                "win32_error": win32_error,
-            }
-        count = struct.unpack_from("<I", payload, 1)[0]
-        records: list[BatchDownloadStreamRecord] = []
-        offset = 5
-        for _ in range(count):
-            p_len, d_len = struct.unpack_from("<II", payload, offset)
-            fd = Win32FindData.unpack(
-                payload[offset + 8 : offset + 8 + WIN32_FIND_DATA_SIZE], encoding=encoding
-            )
-            p_start = offset + 8 + WIN32_FIND_DATA_SIZE
-            rel_p = payload[p_start : p_start + p_len].decode(encoding, errors="replace")
-            rec_data = payload[p_start + p_len : p_start + p_len + d_len]
-            records.append(BatchDownloadStreamRecord(rel_path=rel_p, find_data=fd, data=rec_data))
-            offset = p_start + p_len + d_len
-        return {"opcode": REPLY_DOWNLOAD_BATCH_STREAM, "records": records}
-
     if opcode == REPLY_DOWNLOAD_BATCH_EMPTY:
-        count = struct.unpack_from("<I", payload, 1)[0]
-        empty_records: list[BatchDownloadEmptyRecord] = []
-        offset = 5
-        for _ in range(count):
-            p_len = struct.unpack_from("<I", payload, offset)[0]
-            fd = Win32FindData.unpack(
-                payload[offset + 4 : offset + 4 + WIN32_FIND_DATA_SIZE], encoding=encoding
-            )
-            p_start = offset + 4 + WIN32_FIND_DATA_SIZE
-            rel_p = payload[p_start : p_start + p_len].decode(encoding, errors="replace")
-            empty_records.append(BatchDownloadEmptyRecord(rel_path=rel_p, find_data=fd))
-            offset = p_start + p_len
-        return {"opcode": REPLY_DOWNLOAD_BATCH_EMPTY, "records": empty_records}
+        req_id, item_ids = _decode_req_item_ids(payload)
+        return {"opcode": REPLY_DOWNLOAD_BATCH_EMPTY, "req_id": req_id, "item_ids": item_ids}
 
     if opcode == REPLY_DOWNLOAD_BATCH_DONE:
         if len(payload) >= 7:
@@ -435,64 +386,91 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         return {"opcode": REPLY_DOWNLOAD_BATCH_DONE, "req_id": 0, "status": 0}
 
     if opcode == REPLY_PRECHECK_BATCH:
-        count = struct.unpack_from("<I", payload, 1)[0]
-        conflicts: list[str] = []
-        offset = 5
-        for _ in range(count):
-            p_len = struct.unpack_from("<I", payload, offset)[0]
-            p_str = payload[offset + 4 : offset + 4 + p_len].decode(encoding, errors="replace")
-            conflicts.append(p_str)
-            offset += 4 + p_len
-        return {"opcode": REPLY_PRECHECK_BATCH, "conflicts": conflicts}
+        flag0, insuff_space, has_conflicts, flag3, req_id, count = struct.unpack_from(
+            "<BBBBII", payload, 1
+        )
+        conflict_ids = [
+            struct.unpack_from("<I", payload, 13 + i * 4)[0]
+            for i in range(count)
+            if 13 + (i + 1) * 4 <= len(payload)
+        ]
+        return {
+            "opcode": REPLY_PRECHECK_BATCH,
+            "flag0": flag0,
+            "insufficient_space": bool(insuff_space),
+            "has_conflicts": bool(has_conflicts),
+            "flag3": flag3,
+            "req_id": req_id,
+            "conflict_item_ids": conflict_ids,
+        }
 
     if opcode == REPLY_UPLOAD_BATCH_ERROR:
-        win32_err, p_len = struct.unpack_from("<II", payload, 1)
-        p_str = payload[9 : 9 + p_len].decode(encoding, errors="replace")
-        return {"opcode": REPLY_UPLOAD_BATCH_ERROR, "win32_error": win32_err, "failed_path": p_str}
+        item_id, win32_err, status_val = struct.unpack_from("<III", payload, 1)
+        err_str = None
+        marker_off = 13
+        if (
+            len(payload) >= marker_off + len(_ERRSTR_MARKER) + 4
+            and payload[marker_off : marker_off + len(_ERRSTR_MARKER)] == _ERRSTR_MARKER
+        ):
+            str_off = marker_off + len(_ERRSTR_MARKER)
+            str_len = struct.unpack_from("<I", payload, str_off)[0]
+            err_str = payload[str_off + 4 : str_off + 4 + str_len].decode(
+                "utf-16le", errors="replace"
+            )
+        return {
+            "opcode": REPLY_UPLOAD_BATCH_ERROR,
+            "item_id": item_id,
+            "win32_error": win32_err,
+            "status": status_val,
+            "err_str": err_str,
+        }
 
     if opcode == REPLY_PRECHECK_BATCH_EXT:
-        count = struct.unpack_from("<I", payload, 1)[0]
-        ext_conflicts: list[BatchPrecheckExtConflict] = []
-        offset = 5
-        for _ in range(count):
-            p_len = struct.unpack_from("<I", payload, offset)[0]
-            peer_fd = Win32FindData.unpack(
-                payload[offset + 4 : offset + 4 + WIN32_FIND_DATA_SIZE], encoding=encoding
-            )
-            src_start = offset + 4 + WIN32_FIND_DATA_SIZE
-            src_fd = Win32FindData.unpack(
-                payload[src_start : src_start + WIN32_FIND_DATA_SIZE], encoding=encoding
-            )
-            p_start = src_start + WIN32_FIND_DATA_SIZE
-            p_str = payload[p_start : p_start + p_len].decode(encoding, errors="replace")
-            ext_conflicts.append(
-                BatchPrecheckExtConflict(
-                    rel_path=p_str, peer_find_data=peer_fd, src_find_data=src_fd
-                )
-            )
-            offset = p_start + p_len
-        return {"opcode": REPLY_PRECHECK_BATCH_EXT, "conflicts": ext_conflicts}
+        flag0, flag1, flag2, flag3, req_id, conflict_count, extra_count = struct.unpack_from(
+            "<BBBBIII", payload, 1
+        )
+        offset = 17
+        conflict_ids: list[int] = []
+        for _ in range(conflict_count):
+            if offset + 4 > len(payload):
+                break
+            conflict_ids.append(struct.unpack_from("<I", payload, offset)[0])
+            offset += 4
+        extra_pairs: list[tuple[int, int]] = []
+        for _ in range(extra_count):
+            if offset + 8 > len(payload):
+                break
+            item_id, val = struct.unpack_from("<II", payload, offset)
+            extra_pairs.append((item_id, val))
+            offset += 8
+        return {
+            "opcode": REPLY_PRECHECK_BATCH_EXT,
+            "flag0": flag0,
+            "flag1": flag1,
+            "flag2": flag2,
+            "flag3": flag3,
+            "insufficient_space": bool(flag1),
+            "has_conflicts": bool(flag2),
+            "req_id": req_id,
+            "conflict_item_ids": conflict_ids,
+            "extra_pairs": extra_pairs,
+        }
 
     if opcode == REPLY_DOWNLOAD_UNREADABLE:
-        count = struct.unpack_from("<I", payload, 1)[0]
-        failures: list[tuple[str, int]] = []
-        offset = 5
-        for _ in range(count):
-            p_len, err = struct.unpack_from("<II", payload, offset)
-            p_str = payload[offset + 8 : offset + 8 + p_len].decode(encoding, errors="replace")
-            failures.append((p_str, err))
-            offset += 8 + p_len
-        return {"opcode": REPLY_DOWNLOAD_UNREADABLE, "failures": failures}
+        req_id, item_ids = _decode_req_item_ids(payload)
+        return {"opcode": REPLY_DOWNLOAD_UNREADABLE, "req_id": req_id, "item_ids": item_ids}
 
     if opcode == REPLY_FORMATTED_ERROR:
         count = struct.unpack_from("<I", payload, 1)[0]
         errors: list[tuple[int, str]] = []
         offset = 5
         for _ in range(count):
-            err_code, msg_len = struct.unpack_from("<II", payload, offset)
-            msg = payload[offset + 8 : offset + 8 + msg_len].decode(encoding, errors="replace")
-            errors.append((err_code, msg))
-            offset += 8 + msg_len
+            if offset + 8 > len(payload):
+                break
+            err_code, m_len = struct.unpack_from("<II", payload, offset)
+            m_str = payload[offset + 8 : offset + 8 + m_len].decode("utf-16le", errors="replace")
+            errors.append((err_code, m_str))
+            offset += 8 + m_len
         return {"opcode": REPLY_FORMATTED_ERROR, "errors": errors}
 
     return {"opcode": opcode, "raw": payload}

@@ -3,42 +3,51 @@
 """Encoders and decoders for all Client Commands (0x01..0x39)."""
 
 import struct
+import sys
 from dataclasses import dataclass
 from typing import Any
 
 from openeasysync.constants import (
+    OP_ABORT_BATCH,
     OP_ABORT_UPLOAD,
+    OP_BATCH_CLEAR_READONLY,
+    OP_BATCH_DOWNLOAD_IDS_16,
+    OP_BATCH_DOWNLOAD_IDS_32,
     OP_CANCEL_KEEP_PARTIAL,
-    OP_CANCEL_TRANSFER,
+    OP_CANCEL_SPLITTER,
+    OP_CREATE_BATCH_ZERO_FILES,
     OP_CREATE_DIR,
     OP_DELETE_DIR,
     OP_DELETE_FILE,
     OP_DOWNLOAD_BATCH,
     OP_DOWNLOAD_SINGLE,
-    OP_EXTENDED_XML_MAX,
-    OP_EXTENDED_XML_MIN,
+    OP_EXTENDED_XML_OPCODES,
     OP_EXTRA_XML,
     OP_FILE_CHUNK,
+    OP_FORMAT_WIN32_ERRORS,
     OP_LIST_DIR,
     OP_NOTIFY_ACTIVE_DIR,
     OP_PLUGIN_RPC,
     OP_PRECHECK_BATCH,
     OP_PRECHECK_BATCH_EXT,
-    OP_PRECHECK_SINGLE,
-    OP_QUERY_ERRORS,
+    OP_QUERY_CURRENT_DIR,
     OP_QUERY_ROOT,
-    OP_QUERY_SPACE,
     OP_REMOVE_DIR,
     OP_RENAME,
     OP_RENAME_DIR,
     OP_RENAME_FILE,
-    OP_SET_MAC_MODE,
+    OP_SET_FILE_ATTRS,
     OP_TRANSFER_COMPLETE,
+    OP_UI_NOTIFICATION,
     OP_UPLOAD_SINGLE,
     OP_VERIFY_PEER_NAME,
-    WIN32_FIND_DATA_SIZE,
+    PEER_FLAG_WINXP,
+    PEER_MODE_MAC,
+    PEER_MODE_POSIX,
 )
 from openeasysync.protocol.directory_entry import Win32FindData
+
+_ERRSTR_MARKER = b"ErrStr"
 
 
 @dataclass
@@ -48,10 +57,39 @@ class BatchUploadRecord:
     data: bytes = b""
 
 
-@dataclass
-class BatchPrecheckExtRecord:
-    rel_path: str
-    find_data: Win32FindData
+def default_peer_flags() -> int:
+    """Returns default 0x01 flags matching the running OS and endianness."""
+    if sys.platform == "win32":
+        return PEER_FLAG_WINXP
+    if sys.byteorder == "big":
+        return PEER_MODE_MAC
+    return PEER_MODE_POSIX
+
+
+def _encode_id_path_records(items: list[tuple[int, str]], encoding: str = "utf-16le") -> bytes:
+    """Packs back-to-back (item_id:u32_le, path_len:u16_le, path:wchar_t) records."""
+    body = bytearray()
+    for item_id, path in items:
+        pb = path.encode(encoding, errors="replace")
+        body.extend(struct.pack("<IH", item_id & 0xFFFFFFFF, len(pb)))
+        body.extend(pb)
+    return bytes(body)
+
+
+def _decode_id_path_records(
+    payload: bytes, offset: int, count: int, encoding: str = "utf-16le"
+) -> list[tuple[int, str]]:
+    """Unpacks back-to-back (item_id:u32_le, path_len:u16_le, path:wchar_t) records."""
+    records: list[tuple[int, str]] = []
+    for _ in range(count):
+        if offset + 6 > len(payload):
+            break
+        item_id, path_len = struct.unpack_from("<IH", payload, offset)
+        offset += 6
+        path_str = payload[offset : offset + path_len].decode(encoding, errors="replace")
+        offset += path_len
+        records.append((item_id, path_str))
+    return records
 
 
 # Encoders
@@ -59,7 +97,7 @@ class BatchPrecheckExtRecord:
 
 def encode_query_root(
     computer_name: str = "TXLIN1",
-    flags: int = 0x07,
+    flags: int | None = None,
     code_page: int = 1252,
     path: str | None = None,
 ) -> bytes:
@@ -69,10 +107,11 @@ def encode_query_root(
     [0x01][flags:u8][code_page:u16_le][name_len:u8][computer_name:bytes]
     (11 bytes total for default host query)
     """
+    effective_flags = default_peer_flags() if flags is None else flags
     name = path if path and computer_name == "TXLIN1" else computer_name
     name_bytes = name.encode("ascii", errors="replace")[:255]
     return (
-        bytes([OP_QUERY_ROOT, flags & 0xFF])
+        bytes([OP_QUERY_ROOT, effective_flags & 0xFF])
         + struct.pack("<HB", code_page & 0xFFFF, len(name_bytes))
         + name_bytes
     )
@@ -84,15 +123,18 @@ def encode_notify_active_dir(dir_path: str, encoding: str = "utf-8") -> bytes:
     EasySuite.exe wire format (0x0040da90 / 0x0043d577):
     [0x02][path_len:u8][dir_path:bytes]
     """
-    path_bytes = dir_path.encode(encoding, errors="replace")
-    if len(path_bytes) > 255:
-        path_bytes = path_bytes[:255]
+    path_bytes = dir_path.encode(encoding, errors="replace")[:255]
     return bytes([OP_NOTIFY_ACTIVE_DIR, len(path_bytes)]) + path_bytes
 
 
 def encode_verify_peer_name(computer_name: str, encoding: str = "ascii") -> bytes:
     """Opcode 0x02 alias for backward compatibility."""
     return encode_notify_active_dir(computer_name, encoding=encoding)
+
+
+def encode_refresh_dir() -> bytes:
+    """Opcode 0x03: Refresh Current Directory (1 byte)."""
+    return bytes([OP_QUERY_CURRENT_DIR])
 
 
 def encode_list_dir(dir_path: str, encoding: str = "utf-16le") -> bytes:
@@ -120,31 +162,21 @@ def _encode_single_path_cmd(
 
 
 def encode_delete_file(file_path: str, req_id: int = 1, encoding: str = "utf-16le") -> bytes:
-    """Opcode 0x08: Delete Remote File.
-
-    Wire layout (Section 4.2.8):
-    [0x08][req_id:u32_le][path_len:u16_le][file_path:wchar_t]
-    """
+    """Opcode 0x08: Delete Remote File."""
     return _encode_single_path_cmd(
         OP_DELETE_FILE, file_path, req_id=req_id, encoding=encoding, label="File path"
     )
 
 
 def encode_delete_dir(dir_path: str, req_id: int = 1, encoding: str = "utf-16le") -> bytes:
-    """Opcode 0x06: Remove Remote Directory.
-
-    Wire layout: [0x06][req_id:u32_le][path_len:u16_le][dir_path:wchar_t]
-    """
+    """Opcode 0x06: Remove Remote Directory."""
     return _encode_single_path_cmd(
         OP_REMOVE_DIR, dir_path, req_id=req_id, encoding=encoding, label="Directory path"
     )
 
 
 def encode_create_dir(dir_path: str, req_id: int = 1, encoding: str = "utf-16le") -> bytes:
-    """Opcode 0x07: Create Remote Directory.
-
-    Wire layout: [0x07][req_id:u32_le][path_len:u16_le][dir_path:wchar_t]
-    """
+    """Opcode 0x07: Create Remote Directory."""
     return _encode_single_path_cmd(
         OP_CREATE_DIR, dir_path, req_id=req_id, encoding=encoding, label="Directory path"
     )
@@ -153,10 +185,7 @@ def encode_create_dir(dir_path: str, req_id: int = 1, encoding: str = "utf-16le"
 def encode_rename_file(
     old_path: str, new_path: str, req_id: int = 1, encoding: str = "utf-16le"
 ) -> bytes:
-    """Opcode 0x09: Rename Remote File or Directory.
-
-    Wire layout: [0x09][req_id:u32_le][old_len:u16_le][new_len:u16_le][old_path:wchar_t][new_path:wchar_t]
-    """
+    """Opcode 0x09: Rename Remote File or Directory."""
     old_b = old_path.encode(encoding, errors="replace")
     new_b = new_path.encode(encoding, errors="replace")
     if len(old_b) > 1024 or len(new_b) > 1024:
@@ -178,21 +207,12 @@ def encode_upload_single(
     overwrite: bool = False,
     encoding: str = "utf-16le",
 ) -> bytes:
-    """Opcode 0x0A: Single File Upload Request.
-
-    Wire layout (Section 4.2.4):
-    [0x0A][flags:u8][req_id:u32_le][file_size:u64_le][dest_path_len:u16_le][dest_path:wchar_t]
-    16-byte fixed header followed by UTF-16LE wchar_t destination path including filename.
-    """
+    """Opcode 0x0A: Single File Upload Request."""
     actual_size = 0
     actual_req_id = 1
-    actual_overwrite = overwrite
 
     if isinstance(file_size, Win32FindData):
-        actual_size = file_size.file_size
-        if isinstance(req_id, (bytes, bytearray)):
-            actual_size = len(req_id)
-        actual_req_id = 1
+        actual_size = len(req_id) if isinstance(req_id, (bytes, bytearray)) else file_size.file_size
     elif isinstance(file_size, int):
         actual_size = file_size
         if isinstance(req_id, int):
@@ -205,12 +225,37 @@ def encode_upload_single(
     header = struct.pack(
         "<BBIQH",
         OP_UPLOAD_SINGLE,
-        0x01 if actual_overwrite else 0x00,
+        0x01 if overwrite else 0x00,
         actual_req_id & 0xFFFFFFFF,
         actual_size,
         len(dest_path_bytes),
     )
     return header + dest_path_bytes
+
+
+def encode_download_single(
+    remote_path: str = "",
+    local_path: str = "",
+    req_id: int = 1,
+    *,
+    src_path: str = "",
+    dest_path: str = "",
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Opcode 0x0B: Single File Download Request (Section 4.2.5)."""
+    effective_src = remote_path or src_path
+    effective_dest = local_path or dest_path
+
+    src_path_bytes = effective_src.encode(encoding, errors="replace")
+    if len(src_path_bytes) > 1024:
+        raise ValueError("Source path exceeds 1024-byte EasySuite stack buffer limit")
+
+    dest_path_bytes = effective_dest.encode(encoding, errors="replace") if effective_dest else b""
+    if len(dest_path_bytes) > 1024:
+        raise ValueError("Destination path exceeds 1024-byte EasySuite stack buffer limit")
+
+    header = struct.pack("<BIH", OP_DOWNLOAD_SINGLE, req_id & 0xFFFFFFFF, len(src_path_bytes))
+    return header + src_path_bytes + struct.pack("<H", len(dest_path_bytes)) + dest_path_bytes
 
 
 def encode_file_chunk(
@@ -219,11 +264,7 @@ def encode_file_chunk(
     total_chunks: int,
     chunk_data: bytes,
 ) -> bytes:
-    """Opcode 0x0C: Upload File Data Chunk (Section 4.2.6).
-
-    Framing: [0x0C][item_id:u32_le][chunk_index:u32_le][total_chunks:u32_le][chunk_len:u32_le][data:bytes]
-    17-byte header followed by chunk_data.
-    """
+    """Opcode 0x0C: Upload File Data Chunk (Section 4.2.6)."""
     header = struct.pack(
         "<BIIII",
         OP_FILE_CHUNK,
@@ -235,129 +276,150 @@ def encode_file_chunk(
     return header + chunk_data
 
 
-def encode_transfer_complete(item_id: int = 1, status: int = 0) -> bytes:
-    """Opcode 0x0E: Acknowledge File Transfer Completion (7 bytes).
+def _encode_abort_with_errstr(
+    opcode: int,
+    id_val: int,
+    win32_error: int = 0,
+    err_str: str | None = None,
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Packs [opcode:u8][id:u32_le][win32_error:u32_le] + optional ErrStr suffix."""
+    pkt = struct.pack("<BII", opcode, id_val & 0xFFFFFFFF, win32_error & 0xFFFFFFFF)
+    if err_str is not None:
+        err_b = err_str.encode(encoding, errors="replace")
+        pkt += _ERRSTR_MARKER + struct.pack("<I", len(err_b)) + err_b
+    return pkt
 
-    Framing: [0x0E][item_id:u32_le][status:u16_le]
-    """
+
+def encode_abort_upload(
+    item_id: int = 1,
+    win32_error: int = 0,
+    err_str: str | None = None,
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Opcode 0x0D: Abort Single File Upload (Delete Partial)."""
+    return _encode_abort_with_errstr(OP_ABORT_UPLOAD, item_id, win32_error, err_str, encoding)
+
+
+def encode_transfer_complete(item_id: int = 1, status: int = 0) -> bytes:
+    """Opcode 0x0E: Acknowledge File Transfer Completion (7 bytes)."""
     return struct.pack("<BIH", OP_TRANSFER_COMPLETE, item_id & 0xFFFFFFFF, status & 0xFFFF)
 
 
-def encode_abort_upload(item_id: int = 1, status: int = 0) -> bytes:
-    """Opcode 0x0D: Abort Single File Upload (Delete Partial) (9 bytes).
-
-    Framing: [0x0D][item_id:u32_le][status:u32_le]
-    """
-    return struct.pack("<BII", OP_ABORT_UPLOAD, item_id & 0xFFFFFFFF, status & 0xFFFFFFFF)
-
-
-def encode_cancel_keep_partial(item_id: int = 1, status: int = 0) -> bytes:
-    """Opcode 0x0F: Cancel Single File Transfer (Keep Partial) (9 bytes).
-
-    Framing: [0x0F][item_id:u32_le][status:u32_le]
-    """
-    return struct.pack("<BII", OP_CANCEL_KEEP_PARTIAL, item_id & 0xFFFFFFFF, status & 0xFFFFFFFF)
-
-
-def encode_download_single(
-    remote_path: str = "",
-    local_path: str = "",
-    req_id: int = 1,
-    *,
-    src_path: str = "",
-    dest_path: str = "",
+def encode_cancel_keep_partial(
+    item_id: int = 1,
+    win32_error: int = 0,
+    err_str: str | None = None,
+    encoding: str = "utf-16le",
 ) -> bytes:
-    """Opcode 0x0B: Single File Download Request (Section 4.2.5).
+    """Opcode 0x0F: Cancel Single File Transfer (Keep Partial)."""
+    return _encode_abort_with_errstr(OP_CANCEL_KEEP_PARTIAL, item_id, win32_error, err_str, encoding)
 
-    Framing: [0x0B][req_id:u32_le][src_path_len:u16_le][src_path:wchar_t][dest_path_len:u16_le][dest_path:wchar_t]
-    Base header and lengths comprise exactly 9 bytes.
-    src_path: UTF-16LE without null terminator (max 1024 bytes).
-    dest_path: optional client dest path, UTF-16LE without null terminator (max 1024 bytes).
-    dest_path_len (uint16_le) MUST be present (0x0000 if omitted).
+
+def encode_download_batch(
+    items: list[tuple[int, str]],
+    req_id: int = 1,
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Opcode 0x10: Batch File Download Request (16-bit Count).
+
+    Wire layout: [0x10][req_id:u32_le][item_count:u16_le][records: (item_id:u32_le, path_len:u16_le, path:wchar_t)...]
     """
-    effective_src = remote_path or src_path
-    effective_dest = local_path or dest_path
-
-    src_path_bytes = effective_src.encode("utf-16le")
-    if len(src_path_bytes) > 1024:
-        raise ValueError("Source path exceeds 1024-byte EasySuite stack buffer limit")
-
-    dest_path_bytes = effective_dest.encode("utf-16le") if effective_dest else b""
-    if len(dest_path_bytes) > 1024:
-        raise ValueError("Destination path exceeds 1024-byte EasySuite stack buffer limit")
-
-    header = struct.pack(
-        "<BIH",
-        OP_DOWNLOAD_SINGLE,
-        req_id & 0xFFFFFFFF,
-        len(src_path_bytes),
+    return struct.pack("<BIH", OP_DOWNLOAD_BATCH, req_id & 0xFFFFFFFF, len(items) & 0xFFFF) + _encode_id_path_records(
+        items, encoding=encoding
     )
-    return header + src_path_bytes + struct.pack("<H", len(dest_path_bytes)) + dest_path_bytes
 
 
-def encode_download_batch(paths: list[str], encoding: str = "utf-8") -> bytes:
-    """Opcode 0x10: Batch Download Files/Directories from Peer."""
-    body = bytearray([OP_DOWNLOAD_BATCH])
-    body.extend(struct.pack("<H", len(paths)))
-    for p in paths:
-        pb = p.encode(encoding, errors="replace")
-        body.extend(struct.pack("<I", len(pb)))
-        body.extend(pb)
-    return bytes(body)
+def encode_abort_batch(
+    req_id: int = 1,
+    win32_error: int = 0,
+    err_str: str | None = None,
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Opcode 0x11: Abort Batch File Transfer."""
+    return _encode_abort_with_errstr(OP_ABORT_BATCH, req_id, win32_error, err_str, encoding)
 
 
-def encode_cancel_transfer() -> bytes:
-    """Opcode 0x0D: Abort / Cancel Active Transfer."""
-    return bytes([OP_CANCEL_TRANSFER])
+def _encode_id_path_cmd(
+    opcode: int,
+    items: list[tuple[int, str]],
+    req_id: int = 1,
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Packs [opcode:u8][req_id:u32_le][item_count:u16_le][records...] for 0x12 and 0x15."""
+    return struct.pack("<BIH", opcode, req_id & 0xFFFFFFFF, len(items) & 0xFFFF) + _encode_id_path_records(
+        items, encoding=encoding
+    )
 
 
-def encode_query_space(root_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x0E: Query Drive Free/Total Space."""
-    path_b = root_path.encode(encoding, errors="replace")
-    return bytes([OP_QUERY_SPACE]) + struct.pack("<I", len(path_b)) + path_b
+def encode_batch_clear_readonly(
+    items: list[tuple[int, str]], req_id: int = 1, encoding: str = "utf-16le"
+) -> bytes:
+    """Opcode 0x12: Batch Prepare / Clear Read-Only Attributes."""
+    return _encode_id_path_cmd(OP_BATCH_CLEAR_READONLY, items, req_id=req_id, encoding=encoding)
 
 
-def encode_precheck_single(dest_path: str, encoding: str = "utf-8") -> bytes:
-    """Opcode 0x0F: Pre-Check Single File Overwrite."""
-    path_b = dest_path.encode(encoding, errors="replace")
-    return bytes([OP_PRECHECK_SINGLE]) + struct.pack("<I", len(path_b)) + path_b
+def _encode_precheck_batch_common(
+    opcode: int,
+    items: list[tuple[int, str]],
+    req_id: int = 1,
+    total_size: int = 0,
+    flags: int = 0,
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Packs [opcode:u8][req_id:u32_le][total_size:u64_le][flags:u16_le][item_count:u16_le][records...]."""
+    header = struct.pack(
+        "<BIQHH",
+        opcode,
+        req_id & 0xFFFFFFFF,
+        total_size,
+        flags & 0xFFFF,
+        len(items) & 0xFFFF,
+    )
+    return header + _encode_id_path_records(items, encoding=encoding)
 
 
-def encode_set_mac_mode() -> bytes:
-    """Opcode 0x10: Set Peer Platform = Mac (legacy)."""
-    return bytes([OP_SET_MAC_MODE])
+def encode_precheck_batch(
+    items: list[tuple[int, str]],
+    req_id: int = 1,
+    total_size: int = 0,
+    flags: int = 0,
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Opcode 0x13: Batch Upload Pre-Check (Space & Conflicts)."""
+    return _encode_precheck_batch_common(
+        OP_PRECHECK_BATCH, items, req_id=req_id, total_size=total_size, flags=flags, encoding=encoding
+    )
 
 
-def encode_precheck_batch(dest_dir: str, rel_paths: list[str], encoding: str = "utf-8") -> bytes:
-    """Opcode 0x13: Batch Upload Pre-Check."""
-    dir_b = dest_dir.encode(encoding, errors="replace")
-    body = bytearray([OP_PRECHECK_BATCH])
-    body.extend(struct.pack("<II", len(dir_b), len(rel_paths)))
-    body.extend(dir_b)
-    for rel_p in rel_paths:
-        rb = rel_p.encode(encoding, errors="replace")
-        body.extend(struct.pack("<I", len(rb)))
-        body.extend(rb)
-    return bytes(body)
+def encode_cancel_splitter(job_id: int) -> bytes:
+    """Opcode 0x14: Cancel Active Packet Splitter Job (5 bytes)."""
+    return struct.pack("<BI", OP_CANCEL_SPLITTER, job_id & 0xFFFFFFFF)
+
+
+def encode_create_batch_zero_files(
+    items: list[tuple[int, str]], req_id: int = 1, encoding: str = "utf-16le"
+) -> bytes:
+    """Opcode 0x15: Create Batch Zero-Length Files."""
+    return _encode_id_path_cmd(OP_CREATE_BATCH_ZERO_FILES, items, req_id=req_id, encoding=encoding)
 
 
 def encode_precheck_batch_ext(
-    dest_dir: str,
-    records: list[BatchPrecheckExtRecord],
-    encoding: str = "utf-8",
+    items: list[tuple[int, str]],
+    req_id: int = 1,
+    total_size: int = 0,
+    flags: int = 0,
+    encoding: str = "utf-16le",
 ) -> bytes:
-    """Opcode 0x16: Extended Batch Pre-Check with Metadata."""
-    dir_b = dest_dir.encode(encoding, errors="replace")
-    body = bytearray([OP_PRECHECK_BATCH_EXT])
-    body.extend(struct.pack("<II", len(dir_b), len(records)))
-    body.extend(dir_b)
-    for rec in records:
-        rb = rec.rel_path.encode(encoding, errors="replace")
-        fd_b = rec.find_data.pack(encoding=encoding)
-        body.extend(struct.pack("<I", len(rb)))
-        body.extend(fd_b)
-        body.extend(rb)
-    return bytes(body)
+    """Opcode 0x16: Extended Batch Upload Pre-Check (Section 4.2.7)."""
+    return _encode_precheck_batch_common(
+        OP_PRECHECK_BATCH_EXT, items, req_id=req_id, total_size=total_size, flags=flags, encoding=encoding
+    )
+
+
+def encode_ui_notification(code: int) -> bytes:
+    """Opcode 0x17: UI Notification Command (2 bytes, signed int8 code)."""
+    return struct.pack("<Bb", OP_UI_NOTIFICATION, code)
 
 
 def encode_xml_control(
@@ -369,17 +431,69 @@ def encode_xml_control(
     return bytes([OP_PLUGIN_RPC, len(dll_b)]) + dll_b + struct.pack("<I", len(xml_b)) + xml_b
 
 
-def encode_query_errors(error_codes: list[int]) -> bytes:
-    """Opcode 0x17: Query Localized Win32 Error Strings."""
-    body = bytearray([OP_QUERY_ERRORS])
+def encode_batch_download_ids(
+    items: list[tuple[int, str]],
+    req_id: int = 1,
+    flags_or_cp: int = 0,
+    has_extra: int = 0,
+    use_32bit_count: bool = False,
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Opcode 0x35 (16-bit count) or 0x36 (32-bit count): Multi-ID Batch Download Request."""
+    if use_32bit_count or len(items) > 0xFFFF:
+        header = struct.pack(
+            "<BHIBI",
+            OP_BATCH_DOWNLOAD_IDS_32,
+            flags_or_cp & 0xFFFF,
+            req_id & 0xFFFFFFFF,
+            has_extra & 0xFF,
+            len(items) & 0xFFFFFFFF,
+        )
+    else:
+        header = struct.pack(
+            "<BHIBH",
+            OP_BATCH_DOWNLOAD_IDS_16,
+            flags_or_cp & 0xFFFF,
+            req_id & 0xFFFFFFFF,
+            has_extra & 0xFF,
+            len(items) & 0xFFFF,
+        )
+    return header + _encode_id_path_records(items, encoding=encoding)
+
+
+def encode_set_file_attrs(
+    path: str,
+    attributes: int,
+    creation_time: int = 0,
+    last_access_time: int = 0,
+    last_write_time: int = 0,
+    encoding: str = "utf-16le",
+) -> bytes:
+    """Opcode 0x37: Set Remote File Attributes and Timestamps (fire-and-forget)."""
+    path_b = path.encode(encoding, errors="replace")
+    header = struct.pack(
+        "<BIQQQI",
+        OP_SET_FILE_ATTRS,
+        attributes & 0xFFFFFFFF,
+        creation_time,
+        last_access_time,
+        last_write_time,
+        len(path_b),
+    )
+    return header + path_b
+
+
+def encode_format_win32_errors(error_codes: list[int]) -> bytes:
+    """Opcode 0x38: Format Win32 Error Codes Request."""
+    body = bytearray([OP_FORMAT_WIN32_ERRORS])
     body.extend(struct.pack("<I", len(error_codes)))
     for code in error_codes:
-        body.extend(struct.pack("<I", code))
+        body.extend(struct.pack("<I", code & 0xFFFFFFFF))
     return bytes(body)
 
 
 def encode_extended_xml(opcode: int, xml_content: str) -> bytes:
-    """Opcode 0x32..0x39: Extended XML Command."""
+    """Opcode 0x32 / 0x33 / 0x39: Extended XML Command."""
     xml_b = xml_content.encode("ascii", errors="replace")
     if opcode == OP_EXTRA_XML:
         return bytes([opcode]) + struct.pack("<I", len(xml_b)) + xml_b
@@ -389,6 +503,25 @@ def encode_extended_xml(opcode: int, xml_content: str) -> bytes:
 
 
 # Decoders
+
+
+def _decode_abort_with_errstr(
+    opcode: int, payload: bytes, id_key: str = "item_id", encoding: str = "utf-16le"
+) -> dict[str, Any]:
+    id_val, win32_err = struct.unpack_from("<II", payload, 1)
+    result: dict[str, Any] = {
+        "opcode": opcode,
+        id_key: id_val,
+        "win32_error": win32_err,
+        "err_str": None,
+    }
+    if len(payload) >= 9 + len(_ERRSTR_MARKER) + 4 and payload[9 : 9 + len(_ERRSTR_MARKER)] == _ERRSTR_MARKER:
+        str_off = 9 + len(_ERRSTR_MARKER)
+        str_len = struct.unpack_from("<I", payload, str_off)[0]
+        result["err_str"] = payload[str_off + 4 : str_off + 4 + str_len].decode(
+            encoding, errors="replace"
+        )
+    return result
 
 
 def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
@@ -421,6 +554,9 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         path_str = payload[2 : 2 + path_len].decode(encoding, errors="replace")
         return {"opcode": opcode, "path": path_str, "computer_name": path_str}
 
+    if opcode == OP_QUERY_CURRENT_DIR:
+        return {"opcode": OP_QUERY_CURRENT_DIR}
+
     if opcode == OP_LIST_DIR:
         path_len = struct.unpack_from("<H", payload, 1)[0]
         raw_path = payload[3 : 3 + path_len]
@@ -430,62 +566,10 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             path_str = raw_path.decode(encoding, errors="replace")
         return {"opcode": opcode, "path": path_str}
 
-    if opcode in (
-        OP_DELETE_FILE,
-        OP_REMOVE_DIR,
-        OP_DELETE_DIR,
-        OP_CREATE_DIR,
-    ):
+    if opcode in (OP_DELETE_FILE, OP_REMOVE_DIR, OP_DELETE_DIR, OP_CREATE_DIR):
         req_id, path_len = struct.unpack_from("<IH", payload, 1)
-        raw_path = payload[7 : 7 + path_len]
-        path_str = raw_path.decode("utf-16le", errors="replace")
+        path_str = payload[7 : 7 + path_len].decode("utf-16le", errors="replace")
         return {"opcode": opcode, "req_id": req_id, "path": path_str}
-
-    if opcode == OP_DOWNLOAD_SINGLE:
-        if len(payload) >= 7:
-            req_id, src_len = struct.unpack_from("<IH", payload, 1)
-            src_path = payload[7 : 7 + src_len].decode("utf-16le", errors="replace")
-            dest_path = ""
-            if len(payload) >= 7 + src_len + 2:
-                dest_len = struct.unpack_from("<H", payload, 7 + src_len)[0]
-                dest_path = payload[9 + src_len : 9 + src_len + dest_len].decode(
-                    "utf-16le", errors="replace"
-                )
-            return {
-                "opcode": OP_DOWNLOAD_SINGLE,
-                "req_id": req_id,
-                "path": src_path,
-                "src_path": src_path,
-                "dest_path": dest_path,
-            }
-        path_len = struct.unpack_from("<I", payload, 1)[0]
-        path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
-        return {
-            "opcode": OP_DOWNLOAD_SINGLE,
-            "req_id": 1,
-            "path": path_str,
-            "src_path": path_str,
-            "dest_path": "",
-        }
-
-    if opcode == OP_QUERY_SPACE:
-        if len(payload) >= 7 and struct.calcsize("<IH") == 6:
-            # Check if Opcode 0x0E is Acknowledge File Transfer Completion (7 bytes)
-            item_id, status = struct.unpack_from("<IH", payload, 1)
-            return {"opcode": OP_TRANSFER_COMPLETE, "item_id": item_id, "status": status}
-        path_len = struct.unpack_from("<I", payload, 1)[0]
-        path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
-        return {"opcode": opcode, "path": path_str}
-
-    if opcode in (OP_CANCEL_KEEP_PARTIAL, OP_PRECHECK_SINGLE):
-        if len(payload) == 9:
-            item_id, status = struct.unpack_from("<II", payload, 1)
-            return {"opcode": OP_CANCEL_KEEP_PARTIAL, "item_id": item_id, "status": status}
-        if len(payload) >= 5:
-            path_len = struct.unpack_from("<I", payload, 1)[0]
-            path_str = payload[5 : 5 + path_len].decode(encoding, errors="replace")
-            return {"opcode": OP_PRECHECK_SINGLE, "path": path_str}
-        return {"opcode": OP_PRECHECK_SINGLE, "path": ""}
 
     if opcode in (OP_RENAME, OP_RENAME_FILE, OP_RENAME_DIR):
         req_id, old_len, new_len = struct.unpack_from("<IHH", payload, 1)
@@ -494,98 +578,87 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         return {"opcode": opcode, "req_id": req_id, "old_path": old_path, "new_path": new_path}
 
     if opcode == OP_UPLOAD_SINGLE:
-        if len(payload) >= 16:
-            flags, req_id, file_size, path_len = struct.unpack_from("<BIQH", payload, 1)
-            raw_path = payload[16 : 16 + path_len]
-            dest_path = raw_path.decode("utf-16le", errors="replace")
-            return {
-                "opcode": OP_UPLOAD_SINGLE,
-                "flags": flags,
-                "overwrite": bool(flags & 0x01),
-                "req_id": req_id,
-                "file_size": file_size,
-                "dest_path": dest_path,
-            }
-        # Legacy fallback
-        path_len, data_len = struct.unpack_from("<II", payload, 1)
-        fd = Win32FindData.unpack(payload[9 : 9 + WIN32_FIND_DATA_SIZE], encoding=encoding)
-        path_start = 9 + WIN32_FIND_DATA_SIZE
-        dest_path = payload[path_start : path_start + path_len].decode(encoding, errors="replace")
-        file_data = payload[path_start + path_len : path_start + path_len + data_len]
+        flags, req_id, file_size, path_len = struct.unpack_from("<BIQH", payload, 1)
+        dest_path = payload[16 : 16 + path_len].decode("utf-16le", errors="replace")
         return {
             "opcode": OP_UPLOAD_SINGLE,
+            "flags": flags,
+            "overwrite": bool(flags & 0x01),
+            "req_id": req_id,
+            "file_size": file_size,
             "dest_path": dest_path,
-            "find_data": fd,
-            "file_data": file_data,
-            "file_size": data_len,
-            "flags": 0,
-            "overwrite": False,
-            "req_id": 1,
+        }
+
+    if opcode == OP_DOWNLOAD_SINGLE:
+        req_id, src_len = struct.unpack_from("<IH", payload, 1)
+        src_path = payload[7 : 7 + src_len].decode("utf-16le", errors="replace")
+        dest_path = ""
+        if len(payload) >= 7 + src_len + 2:
+            dest_len = struct.unpack_from("<H", payload, 7 + src_len)[0]
+            dest_path = payload[9 + src_len : 9 + src_len + dest_len].decode(
+                "utf-16le", errors="replace"
+            )
+        return {
+            "opcode": OP_DOWNLOAD_SINGLE,
+            "req_id": req_id,
+            "path": src_path,
+            "src_path": src_path,
+            "dest_path": dest_path,
         }
 
     if opcode == OP_FILE_CHUNK:
-        if len(payload) >= 17:
-            item_id, chunk_index, total_chunks, chunk_len = struct.unpack_from("<IIII", payload, 1)
-            chunk_data = payload[17 : 17 + chunk_len]
-            return {
-                "opcode": OP_FILE_CHUNK,
-                "item_id": item_id,
-                "chunk_index": chunk_index,
-                "total_chunks": total_chunks,
-                "chunk_len": chunk_len,
-                "chunk_data": chunk_data,
-            }
-        return {"opcode": OP_FILE_CHUNK, "raw": payload}
+        item_id, chunk_index, total_chunks, chunk_len = struct.unpack_from("<IIII", payload, 1)
+        chunk_data = payload[17 : 17 + chunk_len]
+        return {
+            "opcode": OP_FILE_CHUNK,
+            "item_id": item_id,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "chunk_len": chunk_len,
+            "chunk_data": chunk_data,
+        }
+
+    if opcode == OP_ABORT_UPLOAD:
+        return _decode_abort_with_errstr(OP_ABORT_UPLOAD, payload, id_key="item_id")
+
+    if opcode == OP_TRANSFER_COMPLETE:
+        item_id, status = struct.unpack_from("<IH", payload, 1)
+        return {"opcode": OP_TRANSFER_COMPLETE, "item_id": item_id, "status": status}
+
+    if opcode == OP_CANCEL_KEEP_PARTIAL:
+        return _decode_abort_with_errstr(OP_CANCEL_KEEP_PARTIAL, payload, id_key="item_id")
 
     if opcode == OP_DOWNLOAD_BATCH:
-        if len(payload) < 3:
-            return {"opcode": OP_DOWNLOAD_BATCH, "paths": []}
-        count = struct.unpack_from("<H", payload, 1)[0]
-        paths: list[str] = []
-        offset = 3
-        for _ in range(count):
-            p_len = struct.unpack_from("<I", payload, offset)[0]
-            p_str = payload[offset + 4 : offset + 4 + p_len].decode(encoding, errors="replace")
-            paths.append(p_str)
-            offset += 4 + p_len
-        return {"opcode": OP_DOWNLOAD_BATCH, "paths": paths}
+        req_id, count = struct.unpack_from("<IH", payload, 1)
+        records = _decode_id_path_records(payload, 7, count)
+        return {"opcode": OP_DOWNLOAD_BATCH, "req_id": req_id, "records": records}
 
-    if opcode in (OP_CANCEL_TRANSFER, OP_ABORT_UPLOAD):
-        if len(payload) == 9:
-            item_id, status = struct.unpack_from("<II", payload, 1)
-            return {"opcode": OP_ABORT_UPLOAD, "item_id": item_id, "status": status}
-        return {"opcode": OP_CANCEL_TRANSFER}
+    if opcode == OP_ABORT_BATCH:
+        return _decode_abort_with_errstr(OP_ABORT_BATCH, payload, id_key="req_id")
 
-    if opcode == OP_SET_MAC_MODE:
-        return {"opcode": OP_SET_MAC_MODE}
+    if opcode in (OP_BATCH_CLEAR_READONLY, OP_CREATE_BATCH_ZERO_FILES):
+        req_id, count = struct.unpack_from("<IH", payload, 1)
+        records = _decode_id_path_records(payload, 7, count)
+        return {"opcode": opcode, "req_id": req_id, "records": records}
 
-    if opcode == OP_PRECHECK_BATCH:
-        dir_len, count = struct.unpack_from("<II", payload, 1)
-        dest_dir = payload[9 : 9 + dir_len].decode(encoding, errors="replace")
-        rel_paths: list[str] = []
-        offset = 9 + dir_len
-        for _ in range(count):
-            r_len = struct.unpack_from("<I", payload, offset)[0]
-            r_path = payload[offset + 4 : offset + 4 + r_len].decode(encoding, errors="replace")
-            rel_paths.append(r_path)
-            offset += 4 + r_len
-        return {"opcode": OP_PRECHECK_BATCH, "dest_dir": dest_dir, "rel_paths": rel_paths}
+    if opcode in (OP_PRECHECK_BATCH, OP_PRECHECK_BATCH_EXT):
+        req_id, total_size, flags, count = struct.unpack_from("<IQHH", payload, 1)
+        records = _decode_id_path_records(payload, 17, count)
+        return {
+            "opcode": opcode,
+            "req_id": req_id,
+            "total_size": total_size,
+            "flags": flags,
+            "records": records,
+        }
 
-    if opcode == OP_PRECHECK_BATCH_EXT:
-        dir_len, count = struct.unpack_from("<II", payload, 1)
-        dest_dir = payload[9 : 9 + dir_len].decode(encoding, errors="replace")
-        ext_records: list[BatchPrecheckExtRecord] = []
-        offset = 9 + dir_len
-        for _ in range(count):
-            r_len = struct.unpack_from("<I", payload, offset)[0]
-            fd = Win32FindData.unpack(
-                payload[offset + 4 : offset + 4 + WIN32_FIND_DATA_SIZE], encoding=encoding
-            )
-            r_start = offset + 4 + WIN32_FIND_DATA_SIZE
-            r_path = payload[r_start : r_start + r_len].decode(encoding, errors="replace")
-            ext_records.append(BatchPrecheckExtRecord(rel_path=r_path, find_data=fd))
-            offset = r_start + r_len
-        return {"opcode": OP_PRECHECK_BATCH_EXT, "dest_dir": dest_dir, "records": ext_records}
+    if opcode == OP_CANCEL_SPLITTER:
+        job_id = struct.unpack_from("<I", payload, 1)[0]
+        return {"opcode": OP_CANCEL_SPLITTER, "job_id": job_id}
+
+    if opcode == OP_UI_NOTIFICATION:
+        code = struct.unpack_from("<b", payload, 1)[0]
+        return {"opcode": OP_UI_NOTIFICATION, "code": code}
 
     if opcode == OP_PLUGIN_RPC:
         if len(payload) >= 2:
@@ -598,12 +671,37 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
                 return {"opcode": opcode, "dll_name": dll_name, "xml": xml_str}
         return {"opcode": opcode, "raw": payload}
 
-    if opcode == OP_QUERY_ERRORS:
+    if opcode in (OP_BATCH_DOWNLOAD_IDS_16, OP_BATCH_DOWNLOAD_IDS_32):
+        count_fmt = "<HIBH" if opcode == OP_BATCH_DOWNLOAD_IDS_16 else "<HIBI"
+        hdr_size = struct.calcsize(count_fmt)
+        flags_or_cp, req_id, has_extra, count = struct.unpack_from(count_fmt, payload, 1)
+        records = _decode_id_path_records(payload, 1 + hdr_size, count)
+        return {
+            "opcode": opcode,
+            "flags_or_cp": flags_or_cp,
+            "req_id": req_id,
+            "has_extra": has_extra,
+            "records": records,
+        }
+
+    if opcode == OP_SET_FILE_ATTRS:
+        attrs, ctime, atime, mtime, path_len = struct.unpack_from("<IQQQI", payload, 1)
+        path_str = payload[33 : 33 + path_len].decode("utf-16le", errors="replace")
+        return {
+            "opcode": OP_SET_FILE_ATTRS,
+            "attributes": attrs,
+            "creation_time": ctime,
+            "last_access_time": atime,
+            "last_write_time": mtime,
+            "path": path_str,
+        }
+
+    if opcode == OP_FORMAT_WIN32_ERRORS:
         count = struct.unpack_from("<I", payload, 1)[0]
         codes = [struct.unpack_from("<I", payload, 5 + i * 4)[0] for i in range(count)]
-        return {"opcode": OP_QUERY_ERRORS, "error_codes": codes}
+        return {"opcode": OP_FORMAT_WIN32_ERRORS, "error_codes": codes}
 
-    if OP_EXTENDED_XML_MIN <= opcode <= OP_EXTENDED_XML_MAX:
+    if opcode in OP_EXTENDED_XML_OPCODES:
         if opcode == OP_EXTRA_XML and len(payload) >= 5:
             xml_len = struct.unpack_from("<I", payload, 1)[0]
             xml_str = payload[5 : 5 + xml_len].decode("ascii", errors="replace")
