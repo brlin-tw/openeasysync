@@ -101,9 +101,6 @@ def test_e2e_single_file_upload_and_download(dual_host_setup):
     src_file_a.write_bytes(payload)
     original_hash = sha256_of_file(str(src_file_a))
 
-    # Precheck before upload: should NOT exist yet
-    assert transfer_a.precheck_single("C:\\uploaded.bin") is False
-
     # Upload A -> B
     success = transfer_a.upload_file(str(src_file_a), "C:\\uploaded.bin")
     assert success is True
@@ -113,9 +110,6 @@ def test_e2e_single_file_upload_and_download(dual_host_setup):
     dest_file_b = dir_b / "uploaded.bin"
     assert dest_file_b.exists()
     assert sha256_of_file(str(dest_file_b)) == original_hash
-
-    # Precheck after upload: should now report EXISTS
-    assert transfer_a.precheck_single("C:\\uploaded.bin") is True
 
     # 2. Download B -> A
     download_dest_a = dir_a / "downloaded_copy.bin"
@@ -151,6 +145,18 @@ def test_e2e_batch_upload_and_download(dual_host_setup):
     assert (b_proj / "empty.txt").exists()
     assert (b_proj / "data.csv").read_text() == "id,val\n1,100\n2,200\n"
     assert (b_proj / "assets" / "image.raw").stat().st_size == 50004
+
+    # Batch Upload with conflict_resolver (0x16 -> 0xAA) on existing target
+    conflicts_seen: list[str] = []
+
+    def _resolve_conflict(rel_path: str, _peer_fd: object) -> str:
+        conflicts_seen.append(rel_path)
+        return "overwrite"
+
+    assert transfer_a.upload_batch(
+        [str(batch_dir)], "C:\\target_project", conflict_resolver=_resolve_conflict
+    )
+    assert len(conflicts_seen) > 0
 
     # Batch Download B -> A into fresh folder
     dest_a_dir = dir_a / "restored_batch"
@@ -376,7 +382,7 @@ def test_session_catches_async_0xa5_and_0xa9_and_aborts_upload(tmp_path):
     def _fake_send_packet_a9(pkt: bytes) -> None:
         sent_packets.append(pkt)
         if pkt[0] == OP_FILE_CHUNK and len(sent_packets) == 1:
-            session._route_message(encode_upload_batch_error(win32_error=112, failed_path="C:\\abort_test.bin"))
+            session._route_message(encode_upload_batch_error(item_id=1, win32_error=112))
 
     session.send_packet = _fake_send_packet_a9  # type: ignore[method-assign]
 

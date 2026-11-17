@@ -355,9 +355,11 @@ class SessionManager:
                     if self._upload_error is None:
                         self._upload_error = OSError(err_msg)
                 return
-            if opcode == REPLY_UPLOAD_BATCH_ERROR and len(message) >= 5:
-                win32_err = struct.unpack_from("<I", message, 1)[0]
-                err_msg = f"Batch upload write error: {format_win32_error(win32_err)}"
+            if opcode == REPLY_UPLOAD_BATCH_ERROR and len(message) >= 13:
+                item_id, win32_err, _status = struct.unpack_from("<III", message, 1)
+                err_msg = (
+                    f"Batch upload write error (item {item_id}): {format_win32_error(win32_err)}"
+                )
                 logger.error("Async upload error 0xA9 received: %s", err_msg)
                 with self._upload_error_lock:
                     if self._upload_error is None:

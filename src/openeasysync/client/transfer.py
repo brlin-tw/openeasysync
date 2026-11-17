@@ -5,6 +5,7 @@
 import os
 import struct
 from collections.abc import Callable, Iterable
+from typing import Any
 
 from openeasysync.client.session import SessionManager
 from openeasysync.constants import (
@@ -13,24 +14,26 @@ from openeasysync.constants import (
     OP_FILE_CHUNK,
     OP_TRANSFER_COMPLETE,
     OP_UPLOAD_SINGLE,
+    PEER_MODE_MAC,
+    PEER_MODE_POSIX,
+    REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
-    REPLY_DOWNLOAD_BATCH_STREAM,
     REPLY_DOWNLOAD_CHUNK,
-    REPLY_DOWNLOAD_SINGLE,
-    REPLY_ERROR_CODE,
+    REPLY_DOWNLOAD_UNREADABLE,
     REPLY_LISTING,
     REPLY_PRECHECK_BATCH_EXT,
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
     STATUS_ACTIVE_DIR_ACK,
     STATUS_ERROR,
-    STATUS_EXISTS,
     STATUS_OK,
 )
 from openeasysync.protocol.commands import (
-    BatchPrecheckExtRecord,
     BatchUploadRecord,
-    encode_cancel_transfer,
+    default_peer_flags,
+    encode_abort_batch,
+    encode_abort_upload,
+    encode_create_batch_zero_files,
     encode_create_dir,
     encode_delete_dir,
     encode_delete_file,
@@ -39,7 +42,6 @@ from openeasysync.protocol.commands import (
     encode_list_dir,
     encode_notify_active_dir,
     encode_precheck_batch_ext,
-    encode_precheck_single,
     encode_query_root,
     encode_rename_dir,
     encode_rename_file,
@@ -47,7 +49,6 @@ from openeasysync.protocol.commands import (
 from openeasysync.protocol.directory_entry import (
     Entry552,
     Win32FindData,
-    filetime_to_unix,
     unix_to_filetime,
 )
 from openeasysync.protocol.replies import decode_reply, format_win32_error
@@ -59,17 +60,20 @@ class TransferManager:
     def __init__(self, session: SessionManager):
         self.session = session
         self._next_item_id = 1
+        self.peer_mode = default_peer_flags() & (PEER_MODE_MAC | PEER_MODE_POSIX)
 
     def _get_next_item_id(self) -> int:
         cur = self._next_item_id
         self._next_item_id = (self._next_item_id + 1) & 0x7FFFFFFF or 1
         return cur
 
-    def query_roots(self) -> list[Entry552]:
+    def query_roots(self, flags: int | None = None) -> list[Entry552]:
         """Queries remote peer root drives/volumes (Opcode 0x01)."""
-        cmd = encode_query_root()
+        effective_flags = default_peer_flags() if flags is None else flags
+        self.peer_mode = effective_flags & (PEER_MODE_MAC | PEER_MODE_POSIX)
+        cmd = encode_query_root(flags=effective_flags)
         rep_bytes = self.session.send_command(
-            cmd, expected_opcodes=(REPLY_ROOTS, REPLY_LISTING, REPLY_ERROR_CODE)
+            cmd, expected_opcodes=(REPLY_ROOTS, REPLY_LISTING)
         )
         rep = decode_reply(rep_bytes)
         if rep["opcode"] == REPLY_ROOTS:
@@ -92,9 +96,6 @@ class TransferManager:
         if rep["opcode"] == REPLY_STATUS_ACK and rep.get("status") == STATUS_ERROR:
             win32_err = rep.get("win32_error", 0)
             raise OSError(f"Remote error querying roots: {format_win32_error(win32_err)}")
-        if rep["opcode"] == REPLY_ERROR_CODE:
-            win32_err = rep.get("win32_error", 0)
-            raise OSError(f"Remote error querying roots: {format_win32_error(win32_err)}")
         return []
 
     def notify_active_dir(self, remote_path: str) -> bool:
@@ -115,10 +116,6 @@ class TransferManager:
         if rep["opcode"] == REPLY_LISTING:
             return rep["entries"]
         if rep["opcode"] == REPLY_STATUS_ACK and rep.get("status") == STATUS_ERROR:
-            win32_err = rep.get("win32_error", 0)
-            err_desc = format_win32_error(win32_err)
-            raise OSError(f"{remote_path} : {err_desc}")
-        if rep["opcode"] == REPLY_ERROR_CODE:
             win32_err = rep.get("win32_error", 0)
             err_desc = format_win32_error(win32_err)
             raise OSError(f"{remote_path} : {err_desc}")
@@ -158,18 +155,6 @@ class TransferManager:
         rep_bytes = self.session.send_command(cmd, expected_opcodes=(REPLY_STATUS_ACK,))
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
-
-    def precheck_single(self, remote_dest_path: str) -> bool:
-        """Checks if destination file already exists on peer (Opcode 0x0F).
-
-        Returns True if file exists, False otherwise.
-        """
-        cmd = encode_precheck_single(remote_dest_path)
-        rep_bytes = self.session.send_command(cmd)
-        rep = decode_reply(rep_bytes)
-        if rep["opcode"] == REPLY_STATUS_ACK:
-            return rep["status"] == STATUS_EXISTS
-        return False
 
     def _stream_upload(
         self,
@@ -388,14 +373,6 @@ class TransferManager:
             self._receive_a3_chunks(local_dest_path, 0, progress_callback, initial_chunk=reply)
             return True
 
-        elif opcode == REPLY_DOWNLOAD_SINGLE:  # legacy 0xA4 fallback
-            rep = decode_reply(reply)
-            with open(local_dest_path, "wb") as f:
-                f.write(rep["file_data"])
-            if progress_callback:
-                progress_callback(len(rep["file_data"]), len(rep["file_data"]))
-            return True
-
         return False
 
     def _receive_a3_chunks(
@@ -494,19 +471,35 @@ class TransferManager:
                 records.append(BatchUploadRecord(rel_path=fn, find_data=fd_f, data=data))
 
         # Check conflicts if conflict_resolver is provided
-        if conflict_resolver:
-            ext_recs = [
-                BatchPrecheckExtRecord(rel_path=r.rel_path, find_data=r.find_data) for r in records
-            ]
-            chk_cmd = encode_precheck_batch_ext(remote_base_dir, ext_recs)
-            rep_bytes = self.session.send_command(chk_cmd)
+        if conflict_resolver and records:
+            precheck_items: list[tuple[int, str]] = []
+            id_to_record: dict[int, BatchUploadRecord] = {}
+            total_size = 0
+            for r in records:
+                item_id = self._get_next_item_id()
+                remote_target = os.path.join(remote_base_dir, r.rel_path).replace("/", "\\")
+                precheck_items.append((item_id, remote_target))
+                id_to_record[item_id] = r
+                if not r.find_data.is_directory:
+                    total_size += r.find_data.file_size
+
+            req_id = self._get_next_item_id()
+            chk_cmd = encode_precheck_batch_ext(
+                precheck_items, req_id=req_id, total_size=total_size
+            )
+            rep_bytes = self.session.send_command(
+                chk_cmd, expected_opcodes=(REPLY_PRECHECK_BATCH_EXT,)
+            )
             rep = decode_reply(rep_bytes)
             if rep["opcode"] == REPLY_PRECHECK_BATCH_EXT:
-                conflicts = {c.rel_path: c.peer_find_data for c in rep["conflicts"]}
+                if rep.get("insufficient_space"):
+                    raise OSError("Insufficient disk space on remote peer")
+                conflict_ids = set(rep["conflict_item_ids"])
                 filtered_records = []
-                for r in records:
-                    if r.rel_path in conflicts:
-                        action = conflict_resolver(r.rel_path, conflicts[r.rel_path])
+                for item_id, _target in precheck_items:
+                    r = id_to_record[item_id]
+                    if item_id in conflict_ids:
+                        action = conflict_resolver(r.rel_path, None)
                         if action.lower() in ("overwrite", "yes", "all"):
                             filtered_records.append(r)
                         elif action.lower() in ("cancel", "abort"):
@@ -515,17 +508,54 @@ class TransferManager:
                         filtered_records.append(r)
                 records = filtered_records
 
+        zero_files: list[tuple[int, str]] = []
         for rec in records:
             remote_target = os.path.join(remote_base_dir, rec.rel_path).replace("/", "\\")
             if rec.find_data.is_directory:
                 self.create_dir(remote_target)
+            elif rec.find_data.file_size == 0:
+                zero_files.append((self._get_next_item_id(), remote_target))
             else:
                 parent = os.path.dirname(remote_target)
                 if parent:
                     self.create_dir(parent)
                 if not self._upload_bytes(remote_target, rec.data, overwrite=True):
                     return False
+
+        if zero_files:
+            z_cmd = encode_create_batch_zero_files(zero_files, req_id=self._get_next_item_id())
+            z_rep = decode_reply(self.session.send_command(z_cmd, expected_opcodes=(REPLY_STATUS_ACK,)))
+            if z_rep.get("status") != STATUS_OK:
+                return False
         return True
+
+    def _collect_remote_batch_items(
+        self, remote_paths: list[str], local_dest_dir: str
+    ) -> list[tuple[int, str, str, bool]]:
+        """Expands remote_paths into (item_id, remote_path, local_path, is_dir) tuples."""
+        items: list[tuple[int, str, str, bool]] = []
+        for rp in remote_paths:
+            clean_rp = rp.rstrip("\\/")
+            base_name = clean_rp.replace("\\", "/").split("/")[-1]
+            local_target = os.path.join(local_dest_dir, base_name)
+            try:
+                entries = self.list_dir(rp)
+                items.append((self._get_next_item_id(), rp, local_target, True))
+                stack: list[tuple[str, str, list[Entry552]]] = [(rp, local_target, entries)]
+                while stack:
+                    cur_r, cur_l, cur_entries = stack.pop()
+                    stripped_r = cur_r.rstrip("\\/")
+                    for entry in cur_entries:
+                        child_r = f"{stripped_r}\\{entry.filename}"
+                        child_l = os.path.join(cur_l, entry.filename)
+                        if entry.is_dir:
+                            items.append((self._get_next_item_id(), child_r, child_l, True))
+                            stack.append((child_r, child_l, self.list_dir(child_r)))
+                        else:
+                            items.append((self._get_next_item_id(), child_r, child_l, False))
+            except OSError:
+                items.append((self._get_next_item_id(), rp, local_target, False))
+        return items
 
     def download_batch(
         self,
@@ -533,55 +563,77 @@ class TransferManager:
         local_dest_dir: str,
         progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> bool:
-        """Batch downloads files/folders from remote peer into local_dest_dir (Opcode 0x0C)."""
+        """Batch downloads files/folders from remote peer into local_dest_dir (Opcode 0x10)."""
         os.makedirs(local_dest_dir, exist_ok=True)
-        cmd = encode_download_batch(remote_paths)
-        replies = self.session.send_command_multi_reply(cmd)
+        items = self._collect_remote_batch_items(remote_paths, local_dest_dir)
+        if not items:
+            return True
 
-        for rep_bytes in replies:
-            rep = decode_reply(rep_bytes)
-            op = rep["opcode"]
+        id_map = {item_id: (rpath, lpath, is_dir) for item_id, rpath, lpath, is_dir in items}
+        req_id = self._get_next_item_id()
+        cmd = encode_download_batch(
+            [(item_id, rpath) for item_id, rpath, _lpath, _is_dir in items], req_id=req_id
+        )
 
-            if op == REPLY_DOWNLOAD_BATCH_EMPTY:
-                for item in rep["records"]:
-                    dest = os.path.join(
-                        local_dest_dir, item.rel_path.replace("\\", "/").lstrip("/")
-                    )
-                    if item.find_data.is_directory:
-                        os.makedirs(dest, exist_ok=True)
-                    else:
-                        parent = os.path.dirname(dest)
-                        if parent:
-                            os.makedirs(parent, exist_ok=True)
-                        with open(dest, "wb") as f:
-                            pass
-                    mtime = filetime_to_unix(item.find_data.last_write_time)
-                    if mtime > 0:
-                        os.utime(dest, (mtime, mtime))
+        self.session.drain_replies()
+        self.session.send_packet(cmd)
 
-            elif op == REPLY_DOWNLOAD_BATCH_STREAM:
-                for item in rep["records"]:
-                    dest = os.path.join(
-                        local_dest_dir, item.rel_path.replace("\\", "/").lstrip("/")
-                    )
-                    parent = os.path.dirname(dest)
-                    if parent:
-                        os.makedirs(parent, exist_ok=True)
-                    with open(dest, "wb") as f:
-                        f.write(item.data)
-                    mtime = filetime_to_unix(item.find_data.last_write_time)
-                    atime = filetime_to_unix(item.find_data.last_access_time)
-                    if mtime > 0:
-                        os.utime(dest, (atime if atime > 0 else mtime, mtime))
-
-        return True
-
-    def cancel_transfer(self) -> bool:
-        """Sends transfer abort/cancel signal (Opcode 0x0D)."""
-        cmd = encode_cancel_transfer()
+        open_files: dict[int, Any] = {}
         try:
-            rep_bytes = self.session.send_command(cmd, timeout=2.0)
-            rep = decode_reply(rep_bytes)
-            return rep["opcode"] == REPLY_STATUS_ACK
+            while True:
+                rep_bytes = self.session.recv_reply(timeout=15.0)
+                rep = decode_reply(rep_bytes)
+                op = rep["opcode"]
+
+                if op == REPLY_DOWNLOAD_CHUNK:
+                    item_id = rep["item_id"]
+                    if item_id in id_map:
+                        _rpath, lpath, _is_dir = id_map[item_id]
+                        if item_id not in open_files:
+                            parent = os.path.dirname(lpath)
+                            if parent:
+                                os.makedirs(parent, exist_ok=True)
+                            open_files[item_id] = open(lpath, "wb")
+                        open_files[item_id].write(rep["data"])
+                        if rep["chunk_index"] + 1 >= rep["total_chunks"]:
+                            open_files.pop(item_id).close()
+
+                elif op == REPLY_DOWNLOAD_BATCH_EMPTY:
+                    for item_id in rep["item_ids"]:
+                        if item_id in id_map:
+                            _rpath, lpath, is_dir = id_map[item_id]
+                            if is_dir:
+                                os.makedirs(lpath, exist_ok=True)
+                            else:
+                                parent = os.path.dirname(lpath)
+                                if parent:
+                                    os.makedirs(parent, exist_ok=True)
+                                with open(lpath, "wb"):
+                                    pass
+
+                elif op == REPLY_DOWNLOAD_UNREADABLE:
+                    continue
+
+                elif op == REPLY_DOWNLOAD_BATCH_DONE:
+                    return rep.get("status", 0) == 0
+        finally:
+            for f in open_files.values():
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+    def cancel_transfer(
+        self, item_id: int = 1, win32_error: int = 0, req_id: int | None = None
+    ) -> bool:
+        """Sends fire-and-forget transfer abort/cancel signal (Opcode 0x0D or 0x11)."""
+        err_str = format_win32_error(win32_error) if self.peer_mode else None
+        if req_id is not None:
+            cmd = encode_abort_batch(req_id=req_id, win32_error=win32_error, err_str=err_str)
+        else:
+            cmd = encode_abort_upload(item_id=item_id, win32_error=win32_error, err_str=err_str)
+        try:
+            self.session.send_packet(cmd)
+            return True
         except Exception:
             return False

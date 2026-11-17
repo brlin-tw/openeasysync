@@ -89,7 +89,7 @@ from openeasysync.protocol.commands import (
     encode_verify_peer_name,
     encode_xml_control,
 )
-from openeasysync.protocol.directory_entry import Win32FindData, make_file_entry
+from openeasysync.protocol.directory_entry import make_file_entry
 from openeasysync.protocol.path_mapping import PathMapper
 from openeasysync.protocol.replies import (
     decode_reply,
@@ -179,7 +179,6 @@ def test_command_encoders_and_decoders():
     assert c09b["opcode"] == OP_RENAME_DIR
 
     # 0x0A Upload Single
-    fd = Win32FindData(filename="doc.txt", file_size=12)
     raw0a = encode_upload_single("C:\\doc.txt", file_size=12, req_id=1, overwrite=False)
     assert len(raw0a) == 16 + len("C:\\doc.txt".encode("utf-16le"))
     c0a = decode_command(raw0a)
