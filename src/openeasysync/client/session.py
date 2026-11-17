@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable
 
 from openeasysync.constants import (
+    BULK_BLOCK_SIZE,
     MODE_OFFLINE,
     MODE_TRANSFER_LINE,
     REPLY_STATUS_ACK,
@@ -91,7 +92,9 @@ class SessionManager:
         self.transport.set_timeout(4000)
 
         # 4. Read Buffer Size & USB Speed
-        self.transport.get_buffer_size()
+        buf_size = self.transport.get_buffer_size()
+        if buf_size > 0:
+            self.poller.max_blocks_per_burst = max(1, min(16, buf_size // BULK_BLOCK_SIZE))
         self.transport.get_usb_speed()
 
         # 5. Enter Transfer Line Mode (0x007F)
