@@ -32,9 +32,9 @@ class PathMapper:
         # If path starts with drive letter like C:/foo, map to /foo
         if len(clean) >= 2 and clean[1] == ":":
             rest = clean[2:]
-            return "/" + rest.lstrip("/") if rest else "/"
+            return os.path.normpath("/" + rest.lstrip("/")) if rest else "/"
 
-        return os.path.normpath(clean)
+        return os.path.normpath("/" + clean.lstrip("/"))
 
     def local_to_wire(self, local_path: str) -> str:
         """Converts a local OS path to wire path."""

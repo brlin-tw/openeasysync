@@ -8,6 +8,9 @@ from typing import Any
 
 from openeasysync.constants import (
     DIR_ENTRY_SIZE,
+    PEER_MODE_MAC,
+    PEER_MODE_POSIX,
+    PEER_MODE_WINDOWS,
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
     REPLY_DOWNLOAD_CHUNK,
@@ -135,13 +138,45 @@ def encode_download_chunk(
     return header + chunk_data
 
 
-def encode_roots_reply(drives: list[tuple[str, int]]) -> bytes:
-    """Opcode 0xA4: Root Drive Listing Reply."""
+def encode_roots_reply(
+    drives: list[tuple[str, int] | tuple[str, int, str, str]],
+    peer_mode: int = PEER_MODE_WINDOWS,
+) -> bytes:
+    """Opcode 0xA4: Root Drive / Volume Listing Reply."""
+    mode_bits = peer_mode & (PEER_MODE_MAC | PEER_MODE_POSIX)
+    if not mode_bits and any(len(d) > 2 for d in drives):
+        mode_bits = PEER_MODE_POSIX
+
     body = bytearray([REPLY_ROOTS])
     body.extend(struct.pack("<H", len(drives)))
-    for letter, dtype in drives:
+    extended_records: list[tuple[str, str]] = []
+
+    for item in drives:
+        letter = item[0]
+        dtype = item[1]
         char_b = letter[0].upper().encode("ascii")
-        body.extend([char_b[0], dtype & 0xFF])
+        wire_dtype = (dtype & 0x0F) | mode_bits
+        body.extend([char_b[0], wire_dtype & 0xFF])
+        if mode_bits:
+            if len(item) >= 4:
+                display_name, root_path = item[2], item[3]
+            else:
+                display_name = "/" if letter == "/" else f"{letter}:"
+                root_path = "/" if letter == "/" else f"{letter}:\\"
+            extended_records.append((display_name, root_path))
+
+    if mode_bits:
+        is_mac = bool(mode_bits & PEER_MODE_MAC)
+        len_fmt = ">H" if is_mac else "<H"
+        str_enc = "utf-16be" if is_mac else "utf-16le"
+        for display_name, root_path in extended_records:
+            name_b = display_name.encode(str_enc)
+            path_b = root_path.encode(str_enc)
+            body.extend(struct.pack(len_fmt, len(name_b)))
+            body.extend(name_b)
+            body.extend(struct.pack(len_fmt, len(path_b)))
+            body.extend(path_b)
+
     return bytes(body)
 
 
@@ -357,15 +392,45 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
     if opcode == REPLY_ROOTS:
         drive_count = struct.unpack_from("<H", payload, 1)[0]
         roots: list[tuple[str, int]] = []
+        mode_bits = 0
         offset = 3
         for _ in range(drive_count):
             if offset + 2 > len(payload):
                 break
             letter_char = chr(payload[offset])
-            dtype = payload[offset + 1] & 0x0F
+            raw_dtype = payload[offset + 1]
+            mode_bits |= raw_dtype & (PEER_MODE_MAC | PEER_MODE_POSIX)
+            dtype = raw_dtype & 0x0F
             roots.append((letter_char, dtype))
             offset += 2
-        return {"opcode": REPLY_ROOTS, "roots": roots}
+
+        result: dict[str, Any] = {"opcode": REPLY_ROOTS, "roots": roots}
+        if mode_bits and offset < len(payload):
+            is_mac = bool(mode_bits & PEER_MODE_MAC)
+            len_fmt = ">H" if is_mac else "<H"
+            str_enc = "utf-16be" if is_mac else "utf-16le"
+            root_entries: list[tuple[str, int, str, str]] = []
+            for letter_char, dtype in roots:
+                if offset + 2 > len(payload):
+                    break
+                name_len = struct.unpack_from(len_fmt, payload, offset)[0]
+                offset += 2
+                display_name = payload[offset : offset + name_len].decode(
+                    str_enc, errors="replace"
+                ).rstrip("\x00")
+                offset += name_len
+                if offset + 2 > len(payload):
+                    break
+                path_len = struct.unpack_from(len_fmt, payload, offset)[0]
+                offset += 2
+                root_path = payload[offset : offset + path_len].decode(
+                    str_enc, errors="replace"
+                ).rstrip("\x00")
+                offset += path_len
+                root_entries.append((letter_char, dtype, display_name, root_path))
+            result["peer_mode"] = PEER_MODE_MAC if is_mac else PEER_MODE_POSIX
+            result["root_entries"] = root_entries
+        return result
 
     if opcode == REPLY_UPLOAD_ERROR:
         item_id, win32_error = struct.unpack_from("<II", payload, 1)
