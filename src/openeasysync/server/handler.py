@@ -200,35 +200,25 @@ class PeerServerHandler:
     def _handle_query_root(self, flags: int = 0) -> list[bytes]:
         if flags & PEER_MODE_MAC:
             self.peer_mode = PEER_MODE_MAC
-        elif flags & PEER_MODE_POSIX:
+        elif flags & PEER_MODE_POSIX or sys.platform != "win32":
             self.peer_mode = PEER_MODE_POSIX
         else:
             self.peer_mode = PEER_MODE_WINDOWS
 
-        roots: list[tuple[str, int]] = []
         if sys.platform == "win32":
             import string
 
+            roots: list[tuple[str, int] | tuple[str, int, str, str]] = []
             for letter in string.ascii_uppercase:
                 root = f"{letter}:\\"
                 if os.path.exists(root):
                     roots.append((letter, DRIVE_FIXED))
+            reply = encode_roots_reply(roots, peer_mode=PEER_MODE_WINDOWS)
         else:
-            roots.append(("C", DRIVE_FIXED))
-            # Check /media or /mnt for mounted removable drives
-            for mnt_dir in ("/media", "/mnt"):
-                if os.path.isdir(mnt_dir):
-                    try:
-                        for entry in os.listdir(mnt_dir):
-                            full_mnt = os.path.join(mnt_dir, entry)
-                            if os.path.ismount(full_mnt):
-                                roots.append(("D", DRIVE_REMOVABLE))
-                                break
-                    except Exception:
-                        pass
+            roots = [("/", DRIVE_FIXED, "/", "/")]
+            reply = encode_roots_reply(roots, peer_mode=self.peer_mode)
 
         ack = encode_status_ack(req_opcode=OP_QUERY_ROOT, status=STATUS_OK)
-        reply = encode_roots_reply(roots)
         return [ack, reply]
 
     def _handle_refresh_dir(self) -> list[bytes]:

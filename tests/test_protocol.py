@@ -371,6 +371,20 @@ def test_reply_encoders_and_decoders():
     assert r_roots["opcode"] == REPLY_ROOTS
     assert r_roots["roots"] == [("C", 2), ("D", 1)]
 
+    # 0xA4 Roots Reply in POSIX (0x20) and Mac (0x10) modes
+    raw_posix_roots = encode_roots_reply([("/", 2, "/", "/")], peer_mode=PEER_MODE_POSIX)
+    assert raw_posix_roots[3:5] == bytes([ord("/"), 0x22])
+    r_posix_roots = decode_reply(raw_posix_roots)
+    assert r_posix_roots["peer_mode"] == PEER_MODE_POSIX
+    assert r_posix_roots["roots"] == [("/", 2)]
+    assert r_posix_roots["root_entries"] == [("/", 2, "/", "/")]
+
+    raw_mac_roots = encode_roots_reply([("/", 2, "Macintosh HD", "/")], peer_mode=0x10)
+    assert raw_mac_roots[3:5] == bytes([ord("/"), 0x12])
+    r_mac_roots = decode_reply(raw_mac_roots)
+    assert r_mac_roots["peer_mode"] == 0x10
+    assert r_mac_roots["root_entries"] == [("/", 2, "Macintosh HD", "/")]
+
     # 0xA6 Batch Download Empty
     r_a6 = decode_reply(encode_download_batch_empty([10, 20], req_id=5))
     assert r_a6 == {"opcode": REPLY_DOWNLOAD_BATCH_EMPTY, "req_id": 5, "item_ids": [10, 20]}
@@ -449,6 +463,12 @@ def test_path_mapper():
 
     wire = mapper.local_to_wire("/tmp/virtual_test/folder/file.txt")
     assert wire == "C:\\folder\\file.txt"
+
+    # POSIX wire paths with Windows-appended backslash (e.g. "/\\" or "/\\bin\\")
+    posix_mapper = PathMapper()
+    assert posix_mapper.wire_to_local("/\\") == "/"
+    assert posix_mapper.wire_to_local("/\\bin\\") == "/bin"
+    assert posix_mapper.wire_to_local("/bin\\X11\\") == "/bin/X11"
 
 
 def test_peer_server_handler_extended_xml():
@@ -701,7 +721,9 @@ def test_peer_server_handler_batch_and_posix_mode(tmp_path):
     assert len(reps_01) == 2
     assert handler.peer_mode == PEER_MODE_POSIX
     r_roots = decode_reply(reps_01[1])
-    assert r_roots["roots"][0] == ("C", 2)
+    assert r_roots["peer_mode"] == PEER_MODE_POSIX
+    assert r_roots["roots"][0] == ("/", 2)
+    assert r_roots["root_entries"][0] == ("/", 2, "/", "/")
 
     # 0x03 without active dir -> status=3
     reps_03_err = handler.handle_command(encode_refresh_dir())

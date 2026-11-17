@@ -78,6 +78,21 @@ class TransferManager:
         rep = decode_reply(rep_bytes)
         if rep["opcode"] == REPLY_ROOTS:
             entries: list[Entry552] = []
+            if "root_entries" in rep:
+                for letter, dtype, display_name, root_path in rep["root_entries"]:
+                    fd = Win32FindData(
+                        filename=root_path or display_name or f"{letter}:\\",
+                        file_attributes=FILE_ATTRIBUTE_DIRECTORY,
+                    )
+                    entry = Entry552(
+                        entry_kind=ENTRY_KIND_DRIVE,
+                        find_data=fd,
+                        drive_type=dtype,
+                        total_bytes=0,
+                        total_free_bytes=0,
+                    )
+                    entries.append(entry)
+                return entries
             for letter, dtype in rep["roots"]:
                 fd = Win32FindData(
                     filename=f"{letter}:\\", file_attributes=FILE_ATTRIBUTE_DIRECTORY
