@@ -11,70 +11,72 @@ from typing import Any
 from openeasysync.constants import (
     DRIVE_FIXED,
     DRIVE_REMOVABLE,
+    FILE_ATTRIBUTE_READONLY,
+    OP_ABORT_BATCH,
     OP_ABORT_UPLOAD,
+    OP_BATCH_CLEAR_READONLY,
+    OP_BATCH_DOWNLOAD_IDS_16,
+    OP_BATCH_DOWNLOAD_IDS_32,
     OP_CANCEL_KEEP_PARTIAL,
-    OP_CANCEL_TRANSFER,
+    OP_CANCEL_SPLITTER,
+    OP_CREATE_BATCH_ZERO_FILES,
     OP_CREATE_DIR,
     OP_DELETE_DIR,
     OP_DELETE_FILE,
     OP_DOWNLOAD_BATCH,
     OP_DOWNLOAD_SINGLE,
-    OP_EXTENDED_XML_MAX,
-    OP_EXTENDED_XML_MIN,
+    OP_EXTENDED_XML_OPCODES,
     OP_FILE_CHUNK,
+    OP_FORMAT_WIN32_ERRORS,
     OP_LIST_DIR,
     OP_NOTIFY_ACTIVE_DIR,
     OP_PRECHECK_BATCH,
     OP_PRECHECK_BATCH_EXT,
-    OP_PRECHECK_SINGLE,
+    OP_QUERY_CURRENT_DIR,
     OP_QUERY_ROOT,
-    OP_QUERY_SPACE,
     OP_RENAME_DIR,
     OP_RENAME_FILE,
-    OP_SET_MAC_MODE,
+    OP_SET_FILE_ATTRS,
     OP_TRANSFER_COMPLETE,
+    OP_UI_NOTIFICATION,
     OP_UPLOAD_SINGLE,
     OP_VERIFY_PEER_NAME,
     OP_VNIC_SWITCH,
     OP_XML_CONTROL,
+    PEER_MODE_MAC,
+    PEER_MODE_POSIX,
+    PEER_MODE_WINDOWS,
     STATUS_ACTIVE_DIR_ACK,
     STATUS_CONFLICT,
     STATUS_DISK_FULL,
     STATUS_ERROR,
     STATUS_EXISTS,
     STATUS_INLINE_SMALL_FILE,
-    STATUS_MAC_MODE_ACK,
     STATUS_OK,
-    STATUS_UPLOAD_BATCH_DONE,
     STATUS_UPLOAD_SINGLE_DONE,
     STATUS_ZERO_LENGTH,
 )
 from openeasysync.protocol.commands import decode_command, encode_extended_xml
 from openeasysync.protocol.directory_entry import (
     Entry552,
-    Win32FindData,
     filetime_to_unix,
-    make_drive_entry,
     make_file_entry,
-    unix_to_filetime,
 )
 from openeasysync.protocol.path_mapping import PathMapper
 from openeasysync.protocol.replies import (
-    BatchDownloadEmptyRecord,
-    BatchDownloadStreamRecord,
-    BatchPrecheckExtConflict,
     encode_download_batch_done,
     encode_download_batch_empty,
-    encode_download_batch_stream,
     encode_download_chunk,
+    encode_download_unreadable,
     encode_error_code,
+    encode_formatted_errors,
     encode_listing_reply,
     encode_precheck_batch_ext_reply,
     encode_precheck_batch_reply,
     encode_roots_reply,
     encode_status_ack,
-    encode_upload_batch_error,
     encode_upload_error,
+    format_win32_error,
 )
 from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
 
@@ -86,6 +88,7 @@ class PeerServerHandler:
         self.mapper = path_mapper or PathMapper()
         self.is_cancelled = False
         self.peer_active_dir = ""
+        self.peer_mode = PEER_MODE_WINDOWS
         self._active_uploads: dict[int, dict[str, Any]] = {}
 
     def handle_command(self, payload: bytes) -> list[bytes]:
@@ -97,13 +100,16 @@ class PeerServerHandler:
         opcode = cmd["opcode"]
 
         if opcode == OP_QUERY_ROOT:
-            return self._handle_query_root()
+            return self._handle_query_root(flags=cmd.get("flags", 0))
 
         if opcode in (OP_NOTIFY_ACTIVE_DIR, OP_VERIFY_PEER_NAME):
             self.peer_active_dir = cmd.get("path", "")
             return [
                 encode_status_ack(req_opcode=OP_NOTIFY_ACTIVE_DIR, status=STATUS_ACTIVE_DIR_ACK)
             ]
+
+        if opcode == OP_QUERY_CURRENT_DIR:
+            return self._handle_refresh_dir()
 
         if opcode == OP_LIST_DIR:
             return self._handle_list_dir(cmd["path"])
@@ -131,44 +137,74 @@ class PeerServerHandler:
         if opcode == OP_TRANSFER_COMPLETE:
             return self._handle_transfer_complete(cmd)
 
-        if opcode in (OP_ABORT_UPLOAD, OP_CANCEL_TRANSFER):
-            if "item_id" in cmd and len(payload) == 9:
-                return self._handle_abort_upload(cmd)
-            self.is_cancelled = True
-            return [encode_status_ack(STATUS_OK)]
+        if opcode == OP_ABORT_UPLOAD:
+            return self._handle_abort_upload(cmd)
 
-        if opcode in (OP_CANCEL_KEEP_PARTIAL, OP_PRECHECK_SINGLE):
-            if "item_id" in cmd and len(payload) == 9:
-                return self._handle_cancel_keep_partial(cmd)
-            return [self._handle_precheck_single(cmd.get("path", ""))]
+        if opcode == OP_CANCEL_KEEP_PARTIAL:
+            return self._handle_cancel_keep_partial(cmd)
 
         if opcode == OP_DOWNLOAD_SINGLE:
             return self._handle_download_single(cmd)
 
-        if opcode == OP_DOWNLOAD_BATCH:
-            return self._handle_download_batch(cmd["paths"])
+        if opcode in (OP_DOWNLOAD_BATCH, OP_BATCH_DOWNLOAD_IDS_16, OP_BATCH_DOWNLOAD_IDS_32):
+            return self._handle_download_batch(
+                cmd.get("records", []), req_id=cmd.get("req_id", 1)
+            )
 
-        if opcode == OP_QUERY_SPACE:
-            return [self._handle_query_space(cmd["path"])]
+        if opcode in (OP_ABORT_BATCH, OP_CANCEL_SPLITTER):
+            self.is_cancelled = True
+            return []
 
-        if opcode == OP_SET_MAC_MODE:
-            return [encode_status_ack(STATUS_MAC_MODE_ACK)]
+        if opcode == OP_UI_NOTIFICATION:
+            return []
 
-        if opcode == OP_PRECHECK_BATCH:
-            return [self._handle_precheck_batch(cmd["dest_dir"], cmd["rel_paths"])]
+        if opcode == OP_BATCH_CLEAR_READONLY:
+            return [
+                self._handle_batch_clear_readonly(
+                    cmd.get("records", []), req_id=cmd.get("req_id", 1)
+                )
+            ]
 
-        if opcode == OP_PRECHECK_BATCH_EXT:
-            return [self._handle_precheck_batch_ext(cmd["dest_dir"], cmd["records"])]
+        if opcode == OP_CREATE_BATCH_ZERO_FILES:
+            return [
+                self._handle_create_batch_zero_files(
+                    cmd.get("records", []), req_id=cmd.get("req_id", 1)
+                )
+            ]
+
+        if opcode in (OP_PRECHECK_BATCH, OP_PRECHECK_BATCH_EXT):
+            return [
+                self._handle_precheck_batch(
+                    opcode=opcode,
+                    records=cmd.get("records", []),
+                    req_id=cmd.get("req_id", 1),
+                    total_size=cmd.get("total_size", 0),
+                )
+            ]
+
+        if opcode == OP_SET_FILE_ATTRS:
+            self._handle_set_file_attrs(cmd)
+            return []
+
+        if opcode == OP_FORMAT_WIN32_ERRORS:
+            return [self._handle_format_errors(cmd.get("error_codes", []))]
 
         if opcode == OP_XML_CONTROL:
             return [self._handle_xml_control(cmd["xml"])]
 
-        if OP_EXTENDED_XML_MIN <= opcode <= OP_EXTENDED_XML_MAX:
+        if opcode in OP_EXTENDED_XML_OPCODES:
             return [self._handle_extended_xml(opcode, cmd.get("xml", ""))]
 
         return [encode_error_code(1)]  # ERROR_INVALID_FUNCTION
 
-    def _handle_query_root(self) -> list[bytes]:
+    def _handle_query_root(self, flags: int = 0) -> list[bytes]:
+        if flags & PEER_MODE_MAC:
+            self.peer_mode = PEER_MODE_MAC
+        elif flags & PEER_MODE_POSIX:
+            self.peer_mode = PEER_MODE_POSIX
+        else:
+            self.peer_mode = PEER_MODE_WINDOWS
+
         roots: list[tuple[str, int]] = []
         if sys.platform == "win32":
             import string
@@ -194,6 +230,16 @@ class PeerServerHandler:
         ack = encode_status_ack(req_opcode=OP_QUERY_ROOT, status=STATUS_OK)
         reply = encode_roots_reply(roots)
         return [ack, reply]
+
+    def _handle_refresh_dir(self) -> list[bytes]:
+        if not self.peer_active_dir:
+            return [encode_status_ack(status=STATUS_EXISTS, req_opcode=OP_QUERY_CURRENT_DIR)]
+        replies = self._handle_list_dir(self.peer_active_dir)
+        if len(replies) == 2:
+            # Rewrite req_opcode to OP_QUERY_CURRENT_DIR
+            replies[0] = encode_status_ack(req_opcode=OP_QUERY_CURRENT_DIR, status=STATUS_OK)
+            return replies
+        return [encode_status_ack(status=STATUS_EXISTS, req_opcode=OP_QUERY_CURRENT_DIR)]
 
     def _handle_list_dir(self, dir_path: str) -> list[bytes]:
         local_path = self.mapper.wire_to_local(dir_path)
@@ -550,146 +596,151 @@ class PeerServerHandler:
                 )
             ]
 
-    def _handle_upload_batch(self, base_dir: str, records: list[Any]) -> bytes:
-        local_base = self.mapper.wire_to_local(base_dir)
-        try:
-            os.makedirs(local_base, exist_ok=True)
-            for rec in records:
-                rel = rec.rel_path.replace("\\", "/").lstrip("/")
-                dest_file = os.path.join(local_base, rel)
-                if rec.find_data.is_directory:
-                    os.makedirs(dest_file, exist_ok=True)
-                else:
-                    parent = os.path.dirname(dest_file)
-                    if parent:
-                        os.makedirs(parent, exist_ok=True)
-                    with open(dest_file, "wb") as f:
-                        f.write(rec.data)
-                    mtime = filetime_to_unix(rec.find_data.last_write_time)
-                    atime = filetime_to_unix(rec.find_data.last_access_time)
-                    if mtime > 0:
-                        os.utime(dest_file, (atime if atime > 0 else mtime, mtime))
-            return encode_status_ack(STATUS_UPLOAD_BATCH_DONE)
-        except Exception as exc:
-            return encode_upload_batch_error(5, str(exc))
+    def _handle_download_batch(
+        self, records: list[tuple[int, str]], req_id: int = 1
+    ) -> list[bytes]:
+        replies: list[bytes] = []
+        empty_ids: list[int] = []
+        unreadable_ids: list[int] = []
 
-    def _handle_download_batch(self, paths: list[str]) -> list[bytes]:
-        stream_records: list[BatchDownloadStreamRecord] = []
-        empty_records: list[BatchDownloadEmptyRecord] = []
-
-        for p in paths:
-            local_p = self.mapper.wire_to_local(p)
+        for item_id, remote_path in records:
+            local_p = self.mapper.wire_to_local(remote_path)
             if not os.path.exists(local_p):
+                unreadable_ids.append(item_id)
                 continue
 
             if os.path.isdir(local_p):
-                # Recursively scan directory
-                for root, dirs, files in os.walk(local_p):
-                    rel_dir = os.path.relpath(root, os.path.dirname(local_p)).replace("/", "\\")
-                    stat_d = os.stat(root)
-                    fd_d = Win32FindData(
-                        file_attributes=0x10,
-                        last_write_time=unix_to_filetime(stat_d.st_mtime),
-                        filename=os.path.basename(root),
-                    )
-                    empty_records.append(BatchDownloadEmptyRecord(rel_path=rel_dir, find_data=fd_d))
+                empty_ids.append(item_id)
+                continue
 
-                    for fn in files:
-                        fp = os.path.join(root, fn)
-                        stat_f = os.stat(fp)
-                        rel_f = os.path.relpath(fp, os.path.dirname(local_p)).replace("/", "\\")
-                        fd_f = Win32FindData(
-                            file_attributes=128,
-                            last_write_time=unix_to_filetime(stat_f.st_mtime),
-                            last_access_time=unix_to_filetime(stat_f.st_atime),
-                            creation_time=unix_to_filetime(stat_f.st_ctime),
-                            file_size=stat_f.st_size,
-                            filename=fn,
+            try:
+                file_size = os.path.getsize(local_p)
+                if file_size == 0:
+                    empty_ids.append(item_id)
+                    continue
+
+                chunk_size = 64000
+                total_chunks = (file_size + chunk_size - 1) // chunk_size
+                with open(local_p, "rb") as f:
+                    for chunk_idx in range(total_chunks):
+                        chunk_data = f.read(chunk_size)
+                        replies.append(
+                            encode_download_chunk(
+                                item_id=item_id,
+                                chunk_index=chunk_idx,
+                                total_chunks=total_chunks,
+                                chunk_data=chunk_data,
+                            )
                         )
-                        if stat_f.st_size == 0:
-                            empty_records.append(
-                                BatchDownloadEmptyRecord(rel_path=rel_f, find_data=fd_f)
-                            )
-                        else:
-                            with open(fp, "rb") as f:
-                                data = f.read()
-                            stream_records.append(
-                                BatchDownloadStreamRecord(rel_path=rel_f, find_data=fd_f, data=data)
-                            )
-            else:
-                stat_f = os.stat(local_p)
-                fn = os.path.basename(local_p)
-                fd_f = Win32FindData(
-                    file_attributes=128,
-                    last_write_time=unix_to_filetime(stat_f.st_mtime),
-                    last_access_time=unix_to_filetime(stat_f.st_atime),
-                    creation_time=unix_to_filetime(stat_f.st_ctime),
-                    file_size=stat_f.st_size,
-                    filename=fn,
-                )
-                if stat_f.st_size == 0:
-                    empty_records.append(BatchDownloadEmptyRecord(rel_path=fn, find_data=fd_f))
-                else:
-                    with open(local_p, "rb") as f:
-                        data = f.read()
-                    stream_records.append(
-                        BatchDownloadStreamRecord(rel_path=fn, find_data=fd_f, data=data)
-                    )
+            except OSError:
+                unreadable_ids.append(item_id)
 
-        replies: list[bytes] = []
-        if empty_records:
-            replies.append(encode_download_batch_empty(empty_records))
-        if stream_records:
-            replies.append(encode_download_batch_stream(stream_records))
-        replies.append(encode_download_batch_done())
+        if empty_ids:
+            replies.append(encode_download_batch_empty(empty_ids, req_id=req_id))
+        if unreadable_ids:
+            replies.append(encode_download_unreadable(unreadable_ids, req_id=req_id))
+        replies.append(encode_download_batch_done(req_id=req_id, status=0))
         return replies
 
-    def _handle_query_space(self, path: str) -> bytes:
-        local_p = self.mapper.wire_to_local(path)
-        chk_dir = local_p if os.path.isdir(local_p) else os.path.dirname(local_p)
+    def _handle_batch_clear_readonly(
+        self, records: list[tuple[int, str]], req_id: int = 1
+    ) -> bytes:
+        for _item_id, remote_path in records:
+            local_p = self.mapper.wire_to_local(remote_path)
+            if os.path.exists(local_p):
+                try:
+                    os.chmod(local_p, os.stat(local_p).st_mode | 0o200)
+                except OSError:
+                    pass
+        return encode_status_ack(STATUS_OK, req_opcode=OP_BATCH_CLEAR_READONLY, req_id=req_id)
+
+    def _handle_create_batch_zero_files(
+        self, records: list[tuple[int, str]], req_id: int = 1
+    ) -> bytes:
         try:
-            usage = shutil.disk_usage(chk_dir or "/")
-            entry = make_drive_entry(path, total_bytes=usage.total, free_bytes=usage.free)
-            return encode_listing_reply([entry])
-        except Exception:
-            return encode_error_code(3)
+            for _item_id, remote_path in records:
+                local_p = self.mapper.wire_to_local(remote_path)
+                parent = os.path.dirname(local_p)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(local_p, "wb"):
+                    pass
+            return encode_status_ack(STATUS_OK, req_opcode=OP_CREATE_BATCH_ZERO_FILES, req_id=req_id)
+        except PermissionError:
+            return encode_error_code(5, req_opcode=OP_CREATE_BATCH_ZERO_FILES, req_id=req_id)
+        except OSError:
+            return encode_error_code(3, req_opcode=OP_CREATE_BATCH_ZERO_FILES, req_id=req_id)
 
-    def _handle_precheck_single(self, path: str) -> bytes:
-        local_p = self.mapper.wire_to_local(path)
-        if os.path.exists(local_p):
-            return encode_status_ack(STATUS_EXISTS)
-        return encode_status_ack(STATUS_OK)
+    def _handle_precheck_batch(
+        self,
+        opcode: int,
+        records: list[tuple[int, str]],
+        req_id: int = 1,
+        total_size: int = 0,
+    ) -> bytes:
+        insufficient_space = False
+        try:
+            check_dir = self.mapper.virtual_root or "/"
+            if records:
+                first_local = self.mapper.wire_to_local(records[0][1])
+                parent = os.path.dirname(first_local)
+                if parent and os.path.exists(parent):
+                    check_dir = parent
+            insufficient_space = shutil.disk_usage(check_dir).free < total_size
+        except OSError:
+            pass
 
-    def _handle_precheck_batch(self, dest_dir: str, rel_paths: list[str]) -> bytes:
-        local_base = self.mapper.wire_to_local(dest_dir)
-        conflicts: list[str] = []
-        for rel in rel_paths:
-            full = os.path.join(local_base, rel.replace("\\", "/").lstrip("/"))
-            if os.path.exists(full):
-                conflicts.append(rel)
-        return encode_precheck_batch_reply(conflicts)
+        conflict_ids = [
+            item_id
+            for item_id, dest_path in records
+            if os.path.exists(self.mapper.wire_to_local(dest_path))
+        ]
 
-    def _handle_precheck_batch_ext(self, dest_dir: str, records: list[Any]) -> bytes:
-        local_base = self.mapper.wire_to_local(dest_dir)
-        conflicts: list[BatchPrecheckExtConflict] = []
-        for rec in records:
-            full = os.path.join(local_base, rec.rel_path.replace("\\", "/").lstrip("/"))
-            if os.path.exists(full):
-                stat = os.stat(full)
-                peer_fd = Win32FindData(
-                    file_attributes=0x10 if os.path.isdir(full) else 128,
-                    last_write_time=unix_to_filetime(stat.st_mtime),
-                    file_size=stat.st_size if not os.path.isdir(full) else 0,
-                    filename=os.path.basename(full),
-                )
-                conflicts.append(
-                    BatchPrecheckExtConflict(
-                        rel_path=rec.rel_path,
-                        peer_find_data=peer_fd,
-                        src_find_data=rec.find_data,
-                    )
-                )
-        return encode_precheck_batch_ext_reply(conflicts)
+        if opcode == OP_PRECHECK_BATCH_EXT:
+            return encode_precheck_batch_ext_reply(
+                conflict_ids,
+                req_id=req_id,
+                flag1=1 if insufficient_space else 0,
+            )
+        return encode_precheck_batch_reply(
+            conflict_ids,
+            req_id=req_id,
+            insufficient_space=insufficient_space,
+        )
+
+    def _handle_set_file_attrs(self, cmd: dict[str, Any]) -> None:
+        local_p = self.mapper.wire_to_local(cmd["path"])
+        if not os.path.exists(local_p):
+            return
+        mtime = filetime_to_unix(cmd.get("last_write_time", 0))
+        atime = filetime_to_unix(cmd.get("last_access_time", 0))
+        if mtime > 0:
+            try:
+                os.utime(local_p, (atime if atime > 0 else mtime, mtime))
+            except OSError:
+                pass
+        attrs = cmd.get("attributes", 0)
+        try:
+            mode = os.stat(local_p).st_mode
+            if attrs & FILE_ATTRIBUTE_READONLY:
+                os.chmod(local_p, mode & ~0o222)
+            else:
+                os.chmod(local_p, mode | 0o200)
+        except OSError:
+            pass
+
+    def _handle_format_errors(self, error_codes: list[int]) -> bytes:
+        formatted: list[tuple[int, str]] = []
+        for code in error_codes:
+            if self.peer_mode in (PEER_MODE_MAC, PEER_MODE_POSIX):
+                try:
+                    msg = os.strerror(code)
+                except ValueError:
+                    msg = format_win32_error(code)
+            else:
+                msg = format_win32_error(code)
+            formatted.append((code, msg))
+        return encode_formatted_errors(formatted)
 
     def _handle_xml_control(self, xml_str: str) -> bytes:
         parsed = parse_oti_msg(xml_str)

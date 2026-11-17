@@ -7,48 +7,65 @@ import struct
 import pytest
 
 from openeasysync.constants import (
-    OP_CANCEL_TRANSFER,
+    OP_ABORT_BATCH,
+    OP_ABORT_UPLOAD,
+    OP_BATCH_CLEAR_READONLY,
+    OP_BATCH_DOWNLOAD_IDS_16,
+    OP_BATCH_DOWNLOAD_IDS_32,
+    OP_CANCEL_KEEP_PARTIAL,
+    OP_CANCEL_SPLITTER,
+    OP_CREATE_BATCH_ZERO_FILES,
     OP_CREATE_DIR,
     OP_DELETE_DIR,
     OP_DELETE_FILE,
     OP_DOWNLOAD_BATCH,
     OP_DOWNLOAD_SINGLE,
     OP_FILE_CHUNK,
+    OP_FORMAT_WIN32_ERRORS,
     OP_LIST_DIR,
     OP_NOTIFY_ACTIVE_DIR,
     OP_PRECHECK_BATCH,
     OP_PRECHECK_BATCH_EXT,
-    OP_PRECHECK_SINGLE,
-    OP_QUERY_ERRORS,
+    OP_QUERY_CURRENT_DIR,
     OP_QUERY_ROOT,
-    OP_QUERY_SPACE,
     OP_RENAME_DIR,
     OP_RENAME_FILE,
+    OP_SET_FILE_ATTRS,
     OP_TRANSFER_COMPLETE,
+    OP_UI_NOTIFICATION,
     OP_UPLOAD_SINGLE,
     OP_VERIFY_PEER_NAME,
     OP_VNIC_SWITCH,
     OP_XML_CONTROL,
+    PEER_MODE_POSIX,
     REPLY_DOWNLOAD_BATCH_DONE,
     REPLY_DOWNLOAD_BATCH_EMPTY,
-    REPLY_DOWNLOAD_BATCH_STREAM,
     REPLY_DOWNLOAD_CHUNK,
-    REPLY_DOWNLOAD_SINGLE,
+    REPLY_DOWNLOAD_UNREADABLE,
+    REPLY_FORMATTED_ERROR,
     REPLY_LISTING,
     REPLY_PRECHECK_BATCH,
     REPLY_PRECHECK_BATCH_EXT,
     REPLY_ROOTS,
     REPLY_STATUS_ACK,
+    REPLY_UPLOAD_BATCH_ERROR,
     REPLY_UPLOAD_ERROR,
     STATUS_ERROR,
+    STATUS_EXISTS,
     STATUS_INLINE_SMALL_FILE,
     STATUS_OK,
     STATUS_ZERO_LENGTH,
 )
 from openeasysync.protocol.commands import (
-    BatchPrecheckExtRecord,
     decode_command,
-    encode_cancel_transfer,
+    default_peer_flags,
+    encode_abort_batch,
+    encode_abort_upload,
+    encode_batch_clear_readonly,
+    encode_batch_download_ids,
+    encode_cancel_keep_partial,
+    encode_cancel_splitter,
+    encode_create_batch_zero_files,
     encode_create_dir,
     encode_delete_dir,
     encode_delete_file,
@@ -56,17 +73,18 @@ from openeasysync.protocol.commands import (
     encode_download_single,
     encode_extended_xml,
     encode_file_chunk,
+    encode_format_win32_errors,
     encode_list_dir,
     encode_notify_active_dir,
     encode_precheck_batch,
     encode_precheck_batch_ext,
-    encode_precheck_single,
-    encode_query_errors,
     encode_query_root,
-    encode_query_space,
+    encode_refresh_dir,
     encode_rename_dir,
     encode_rename_file,
+    encode_set_file_attrs,
     encode_transfer_complete,
+    encode_ui_notification,
     encode_upload_single,
     encode_verify_peer_name,
     encode_xml_control,
@@ -74,20 +92,18 @@ from openeasysync.protocol.commands import (
 from openeasysync.protocol.directory_entry import Win32FindData, make_file_entry
 from openeasysync.protocol.path_mapping import PathMapper
 from openeasysync.protocol.replies import (
-    BatchDownloadEmptyRecord,
-    BatchDownloadStreamRecord,
-    BatchPrecheckExtConflict,
     decode_reply,
     encode_download_batch_done,
     encode_download_batch_empty,
-    encode_download_batch_stream,
-    encode_download_single_reply,
+    encode_download_unreadable,
     encode_error_code,
+    encode_formatted_errors,
     encode_listing_reply,
     encode_precheck_batch_ext_reply,
     encode_precheck_batch_reply,
     encode_roots_reply,
     encode_status_ack,
+    encode_upload_batch_error,
     encode_upload_error,
 )
 from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
@@ -99,12 +115,20 @@ def test_command_encoders_and_decoders():
     # 0x01 Query Root (11 bytes total for default host query)
     raw01 = encode_query_root()
     assert len(raw01) == 11
-    assert raw01 == bytes([OP_QUERY_ROOT, 0x07, 0xE4, 0x04, 0x06]) + b"TXLIN1"
+    assert raw01 == bytes([OP_QUERY_ROOT, default_peer_flags(), 0xE4, 0x04, 0x06]) + b"TXLIN1"
     c01 = decode_command(raw01)
     assert c01["opcode"] == OP_QUERY_ROOT
     assert c01["computer_name"] == "TXLIN1"
-    assert c01["flags"] == 0x07
+    assert c01["flags"] == default_peer_flags()
     assert c01["code_page"] == 1252
+
+    # Explicit flags override on 0x01
+    c01_win = decode_command(encode_query_root(flags=0x07))
+    assert c01_win["flags"] == 0x07
+
+    # 0x03 Refresh Current Directory
+    c03 = decode_command(encode_refresh_dir())
+    assert c03["opcode"] == OP_QUERY_CURRENT_DIR
 
     # Test backwards-compatible 1-byte decode
     assert decode_command(bytes([OP_QUERY_ROOT]))["opcode"] == OP_QUERY_ROOT
@@ -202,44 +226,96 @@ def test_command_encoders_and_decoders():
     assert c0b["path"] == "C:\\doc.txt"
 
     # 0x10 Batch Download
-    c10 = decode_command(encode_download_batch(["C:\\p1", "C:\\p2"]))
+    c10 = decode_command(encode_download_batch([(1, "C:\\p1"), (2, "C:\\p2")], req_id=9))
     assert c10["opcode"] == OP_DOWNLOAD_BATCH
-    assert c10["paths"] == ["C:\\p1", "C:\\p2"]
+    assert c10["req_id"] == 9
+    assert c10["records"] == [(1, "C:\\p1"), (2, "C:\\p2")]
 
-    # 0x0D Cancel Transfer
-    c0d = decode_command(encode_cancel_transfer())
-    assert c0d["opcode"] == OP_CANCEL_TRANSFER
+    # 0x35 / 0x36 Multi-ID Batch Download
+    c35 = decode_command(encode_batch_download_ids([(10, "C:\\a.txt")], req_id=3, flags_or_cp=1252))
+    assert c35["opcode"] == OP_BATCH_DOWNLOAD_IDS_16
+    assert c35["flags_or_cp"] == 1252
+    assert c35["req_id"] == 3
+    assert c35["records"] == [(10, "C:\\a.txt")]
 
-    # 0x0E Query Space
-    c0e = decode_command(encode_query_space("C:\\"))
-    assert c0e["opcode"] == OP_QUERY_SPACE
+    c36 = decode_command(
+        encode_batch_download_ids([(20, "C:\\b.txt")], req_id=4, use_32bit_count=True)
+    )
+    assert c36["opcode"] == OP_BATCH_DOWNLOAD_IDS_32
+    assert c36["records"] == [(20, "C:\\b.txt")]
 
-    # 0x0F Precheck Single
-    c0f = decode_command(encode_precheck_single("C:\\file.txt"))
-    assert c0f["opcode"] == OP_PRECHECK_SINGLE
+    # 0x0D Abort Upload / 0x0F Cancel Keep Partial / 0x11 Abort Batch (with & without ErrStr)
+    c0d = decode_command(encode_abort_upload(item_id=7, win32_error=5))
+    assert c0d == {"opcode": OP_ABORT_UPLOAD, "item_id": 7, "win32_error": 5, "err_str": None}
 
-    # 0x13 Batch Precheck
-    c13 = decode_command(encode_precheck_batch("C:\\Base", ["f1.txt", "f2.txt"]))
+    c0f = decode_command(encode_cancel_keep_partial(item_id=8, win32_error=2, err_str="Not found"))
+    assert c0f == {
+        "opcode": OP_CANCEL_KEEP_PARTIAL,
+        "item_id": 8,
+        "win32_error": 2,
+        "err_str": "Not found",
+    }
+
+    c11 = decode_command(encode_abort_batch(req_id=9, win32_error=112, err_str="No space"))
+    assert c11 == {
+        "opcode": OP_ABORT_BATCH,
+        "req_id": 9,
+        "win32_error": 112,
+        "err_str": "No space",
+    }
+
+    # 0x12 Batch Clear Read-Only & 0x15 Create Batch Zero-Length Files
+    c12 = decode_command(encode_batch_clear_readonly([(1, "C:\\ro.txt")], req_id=5))
+    assert c12 == {"opcode": OP_BATCH_CLEAR_READONLY, "req_id": 5, "records": [(1, "C:\\ro.txt")]}
+
+    c15 = decode_command(encode_create_batch_zero_files([(2, "C:\\z.txt")], req_id=6))
+    assert c15 == {"opcode": OP_CREATE_BATCH_ZERO_FILES, "req_id": 6, "records": [(2, "C:\\z.txt")]}
+
+    # 0x13 Batch Precheck & 0x16 Batch Precheck Ext
+    c13 = decode_command(
+        encode_precheck_batch([(1, "C:\\Base\\f1.txt"), (2, "C:\\Base\\f2.txt")], req_id=10, total_size=2048, flags=1)
+    )
     assert c13["opcode"] == OP_PRECHECK_BATCH
-    assert c13["dest_dir"] == "C:\\Base"
-    assert c13["rel_paths"] == ["f1.txt", "f2.txt"]
+    assert c13["req_id"] == 10
+    assert c13["total_size"] == 2048
+    assert c13["flags"] == 1
+    assert c13["records"] == [(1, "C:\\Base\\f1.txt"), (2, "C:\\Base\\f2.txt")]
 
-    # 0x16 Batch Precheck Ext
     c16 = decode_command(
-        encode_precheck_batch_ext("C:\\Base", [BatchPrecheckExtRecord("f1.txt", fd)])
+        encode_precheck_batch_ext([(3, "C:\\Base\\f3.txt")], req_id=11, total_size=4096)
     )
     assert c16["opcode"] == OP_PRECHECK_BATCH_EXT
-    assert len(c16["records"]) == 1
+    assert c16["req_id"] == 11
+    assert c16["total_size"] == 4096
+    assert c16["records"] == [(3, "C:\\Base\\f3.txt")]
+
+    # 0x14 Cancel Splitter & 0x17 UI Notification
+    c14 = decode_command(encode_cancel_splitter(job_id=42))
+    assert c14 == {"opcode": OP_CANCEL_SPLITTER, "job_id": 42}
+
+    c17 = decode_command(encode_ui_notification(-1))
+    assert c17 == {"opcode": OP_UI_NOTIFICATION, "code": -1}
 
     # 0x34 XML Control (<OTIMSG>)
     c34 = decode_command(encode_xml_control("<OTIMSG></OTIMSG>"))
     assert c34["opcode"] == OP_XML_CONTROL
     assert c34["xml"] == "<OTIMSG></OTIMSG>"
 
-    # 0x17 Query Errors
-    c17 = decode_command(encode_query_errors([5, 112]))
-    assert c17["opcode"] == OP_QUERY_ERRORS
-    assert c17["error_codes"] == [5, 112]
+    # 0x37 Set File Attributes & Timestamps
+    c37 = decode_command(encode_set_file_attrs("C:\\a.txt", 0x21, 100, 200, 300))
+    assert c37 == {
+        "opcode": OP_SET_FILE_ATTRS,
+        "attributes": 0x21,
+        "creation_time": 100,
+        "last_access_time": 200,
+        "last_write_time": 300,
+        "path": "C:\\a.txt",
+    }
+
+    # 0x38 Format Win32 Errors
+    c38 = decode_command(encode_format_win32_errors([5, 112]))
+    assert c38["opcode"] == OP_FORMAT_WIN32_ERRORS
+    assert c38["error_codes"] == [5, 112]
 
     # 0x32 Virtual NIC Switch XML
     c32 = decode_command(
@@ -292,41 +368,58 @@ def test_reply_encoders_and_decoders():
     assert r_a2["entries"][0].filename == "sample.txt"
 
     # 0xA4 Roots Reply
-    r_roots = decode_reply(encode_roots_reply([("C", 3), ("D", 2)]))
+    r_roots = decode_reply(encode_roots_reply([("C", 2), ("D", 1)]))
     assert r_roots["opcode"] == REPLY_ROOTS
-    assert r_roots["roots"] == [("C", 3), ("D", 2)]
-
-    # 0xA4 Single Download Reply
-    fd = Win32FindData(filename="sample.txt", file_size=4)
-    r_a4 = decode_reply(encode_download_single_reply(fd, b"TEST"))
-    assert r_a4["opcode"] == REPLY_DOWNLOAD_SINGLE
-    assert r_a4["file_data"] == b"TEST"
-
-    # 0xA5 Batch Download Stream
-    rec = BatchDownloadStreamRecord(rel_path="a\\b.txt", find_data=fd, data=b"DATA")
-    r_a5 = decode_reply(encode_download_batch_stream([rec]))
-    assert r_a5["opcode"] == REPLY_DOWNLOAD_BATCH_STREAM
-    assert len(r_a5["records"]) == 1
+    assert r_roots["roots"] == [("C", 2), ("D", 1)]
 
     # 0xA6 Batch Download Empty
-    rec_empty = BatchDownloadEmptyRecord(rel_path="empty_folder", find_data=fd)
-    r_a6 = decode_reply(encode_download_batch_empty([rec_empty]))
-    assert r_a6["opcode"] == REPLY_DOWNLOAD_BATCH_EMPTY
+    r_a6 = decode_reply(encode_download_batch_empty([10, 20], req_id=5))
+    assert r_a6 == {"opcode": REPLY_DOWNLOAD_BATCH_EMPTY, "req_id": 5, "item_ids": [10, 20]}
 
     # 0xA7 Batch Download Done
-    r_a7 = decode_reply(encode_download_batch_done())
-    assert r_a7["opcode"] == REPLY_DOWNLOAD_BATCH_DONE
+    r_a7 = decode_reply(encode_download_batch_done(req_id=5, status=0))
+    assert r_a7 == {"opcode": REPLY_DOWNLOAD_BATCH_DONE, "req_id": 5, "status": 0}
 
     # 0xA8 Precheck Batch Reply
-    r_a8 = decode_reply(encode_precheck_batch_reply(["conf1.txt", "conf2.txt"]))
+    r_a8 = decode_reply(encode_precheck_batch_reply([1, 3], req_id=7, insufficient_space=True))
     assert r_a8["opcode"] == REPLY_PRECHECK_BATCH
-    assert r_a8["conflicts"] == ["conf1.txt", "conf2.txt"]
+    assert r_a8["insufficient_space"] is True
+    assert r_a8["has_conflicts"] is True
+    assert r_a8["req_id"] == 7
+    assert r_a8["conflict_item_ids"] == [1, 3]
+
+    # 0xA9 Batch Upload Error Notification (with & without ErrStr)
+    r_a9 = decode_reply(encode_upload_batch_error(item_id=4, win32_error=112, status=1))
+    assert r_a9 == {
+        "opcode": REPLY_UPLOAD_BATCH_ERROR,
+        "item_id": 4,
+        "win32_error": 112,
+        "status": 1,
+        "err_str": None,
+    }
+    r_a9_str = decode_reply(
+        encode_upload_batch_error(item_id=4, win32_error=5, status=1, err_str="Denied")
+    )
+    assert r_a9_str["err_str"] == "Denied"
 
     # 0xAA Precheck Batch Ext Reply
-    conflict = BatchPrecheckExtConflict("c.txt", fd, fd)
-    r_aa = decode_reply(encode_precheck_batch_ext_reply([conflict]))
+    r_aa = decode_reply(
+        encode_precheck_batch_ext_reply([2], req_id=8, extra_pairs=[(2, 99)], flag1=1)
+    )
     assert r_aa["opcode"] == REPLY_PRECHECK_BATCH_EXT
-    assert len(r_aa["conflicts"]) == 1
+    assert r_aa["insufficient_space"] is True
+    assert r_aa["has_conflicts"] is True
+    assert r_aa["req_id"] == 8
+    assert r_aa["conflict_item_ids"] == [2]
+    assert r_aa["extra_pairs"] == [(2, 99)]
+
+    # 0xAB Batch Unreadable Files Notification
+    r_ab = decode_reply(encode_download_unreadable([9, 11], req_id=6))
+    assert r_ab == {"opcode": REPLY_DOWNLOAD_UNREADABLE, "req_id": 6, "item_ids": [9, 11]}
+
+    # 0xAC Formatted Win32 Error Strings Reply (UTF-16LE)
+    r_ac = decode_reply(encode_formatted_errors([(5, "Access is denied.")]))
+    assert r_ac == {"opcode": REPLY_FORMATTED_ERROR, "errors": [(5, "Access is denied.")]}
 
 
 def test_otimsg_xml_build_and_parse():
@@ -597,3 +690,72 @@ def test_file_management_wire_framing(tmp_path):
     assert rep_err["req_id"] == 78
     assert rep_err["status"] == STATUS_ERROR
     assert rep_err["win32_error"] == 2
+
+
+def test_peer_server_handler_batch_and_posix_mode(tmp_path):
+    """Verify PeerServerHandler supports 0x01 POSIX mode (0x20), 0x03, batch ops, 0x37, and 0x38."""
+    mapper = PathMapper(virtual_root=str(tmp_path))
+    handler = PeerServerHandler(path_mapper=mapper)
+
+    # 0x01 with flags=0x20 sets POSIX peer mode and returns 0xA1 + 0xA4 (GetDriveTypeA - 1)
+    reps_01 = handler.handle_command(encode_query_root(flags=PEER_MODE_POSIX))
+    assert len(reps_01) == 2
+    assert handler.peer_mode == PEER_MODE_POSIX
+    r_roots = decode_reply(reps_01[1])
+    assert r_roots["roots"][0] == ("C", 2)
+
+    # 0x03 without active dir -> status=3
+    reps_03_err = handler.handle_command(encode_refresh_dir())
+    assert decode_reply(reps_03_err[0])["status"] == STATUS_EXISTS
+
+    # Set active dir via 0x02, then 0x03 -> 0xA1(status=0) + 0xA2
+    (tmp_path / "hello.txt").write_bytes(b"abc")
+    handler.handle_command(encode_notify_active_dir("C:\\"))
+    reps_03_ok = handler.handle_command(encode_refresh_dir())
+    assert len(reps_03_ok) == 2
+    assert decode_reply(reps_03_ok[0])["status"] == STATUS_OK
+    assert decode_reply(reps_03_ok[1])["entries"][0].filename == "hello.txt"
+
+    # 0x15 Create Batch Zero-Length Files
+    reps_15 = handler.handle_command(encode_create_batch_zero_files([(1, "C:\\empty.bin")], req_id=3))
+    assert decode_reply(reps_15[0])["status"] == STATUS_OK
+    assert (tmp_path / "empty.bin").read_bytes() == b""
+
+    # 0x13 & 0x16 Batch Precheck
+    reps_13 = handler.handle_command(
+        encode_precheck_batch([(1, "C:\\hello.txt"), (2, "C:\\new.txt")], req_id=4, total_size=10)
+    )
+    dec_13 = decode_reply(reps_13[0])
+    assert dec_13["conflict_item_ids"] == [1]
+    assert dec_13["insufficient_space"] is False
+
+    reps_16 = handler.handle_command(
+        encode_precheck_batch_ext([(1, "C:\\hello.txt"), (2, "C:\\new.txt")], req_id=5, total_size=10)
+    )
+    assert decode_reply(reps_16[0])["conflict_item_ids"] == [1]
+
+    # 0x10 / 0x35 Batch Download: 0xA3 chunks + 0xA6 empty + 0xAB unreadable + 0xA7 done
+    reps_10 = handler.handle_command(
+        encode_download_batch([(1, "C:\\hello.txt"), (2, "C:\\empty.bin"), (3, "C:\\missing.txt")], req_id=6)
+    )
+    decoded_10 = [decode_reply(r) for r in reps_10]
+    assert decoded_10[0]["opcode"] == REPLY_DOWNLOAD_CHUNK
+    assert decoded_10[0]["item_id"] == 1
+    assert decoded_10[0]["data"] == b"abc"
+    assert decoded_10[1] == {"opcode": REPLY_DOWNLOAD_BATCH_EMPTY, "req_id": 6, "item_ids": [2]}
+    assert decoded_10[2] == {"opcode": REPLY_DOWNLOAD_UNREADABLE, "req_id": 6, "item_ids": [3]}
+    assert decoded_10[3] == {"opcode": REPLY_DOWNLOAD_BATCH_DONE, "req_id": 6, "status": 0}
+
+    # 0x37 Set File Attributes & Timestamps (fire-and-forget -> no reply)
+    assert handler.handle_command(encode_set_file_attrs("C:\\hello.txt", 0x20, 0, 0, 0)) == []
+
+    # 0x12 Batch Clear Read-Only -> 0xA1(status=0)
+    reps_12 = handler.handle_command(encode_batch_clear_readonly([(1, "C:\\hello.txt")], req_id=7))
+    assert decode_reply(reps_12[0])["status"] == STATUS_OK
+
+    # 0x38 Format Errors -> 0xAC (UTF-16LE, strerror in POSIX mode)
+    reps_38 = handler.handle_command(encode_format_win32_errors([2]))
+    dec_38 = decode_reply(reps_38[0])
+    assert dec_38["opcode"] == REPLY_FORMATTED_ERROR
+    assert dec_38["errors"][0][0] == 2
+    assert len(dec_38["errors"][0][1]) > 0
