@@ -13,6 +13,7 @@ from openeasysync.constants import (
     BULK_BLOCK_SIZE,
     MODE_OFFLINE,
     MODE_TRANSFER_LINE,
+    OP_EXTENDED_XML_OPCODES,
     REPLY_STATUS_ACK,
     REPLY_UPLOAD_BATCH_ERROR,
     REPLY_UPLOAD_ERROR,
@@ -21,12 +22,21 @@ from openeasysync.constants import (
 from openeasysync.framing.poller import LinkPoller
 from openeasysync.framing.reassembler import PacketReassembler
 from openeasysync.framing.splitter import PacketSplitter
+from openeasysync.protocol.commands import (
+    VNIC_CMD_ACCEPT_SWITCH,
+    VNIC_CMD_REJECT_SWITCH,
+    decode_command,
+    encode_vnic_switch_request,
+    encode_vnic_switch_role,
+)
 from openeasysync.protocol.path_mapping import PathMapper
 from openeasysync.protocol.replies import format_win32_error
 from openeasysync.server.handler import PeerServerHandler
 from openeasysync.transport.base import TransportBackend
 
 logger = logging.getLogger("openeasysync.session")
+
+MAX_TX_QUEUE_BLOCKS = 32  # 2 MiB at 64 KiB/block
 
 
 class SessionManager:
@@ -74,6 +84,11 @@ class SessionManager:
     @property
     def is_connected(self) -> bool:
         return self._is_connected
+
+    @property
+    def last_activity_time(self) -> float:
+        """Timestamp of the most recent bulk TX/RX block activity."""
+        return self._last_activity_time
 
     def connect(
         self,
@@ -186,28 +201,42 @@ class SessionManager:
         if err is not None:
             raise err
 
-    def flush_tx(self, timeout: float = 10.0) -> None:
-        """Waits for queued TX blocks to drain, aborting on async upload errors."""
+    def _wait_tx_progress(self, target_max_qsize: int, timeout: float = 10.0) -> None:
+        """Waits until tx_queue.qsize() <= target_max_qsize, timing out only on stall."""
         if not self._running:
             self.check_upload_error()
             return
-        start = time.time()
-        while not self.poller.tx_queue.empty():
+
+        last_qsize = self.poller.tx_queue.qsize()
+        last_progress = time.monotonic()
+        while last_qsize > target_max_qsize:
             self.check_upload_error()
-            if time.time() - start >= timeout:
-                raise TimeoutError(f"Timeout waiting for TX queue to drain after {timeout} seconds")
+            if time.monotonic() - last_progress >= timeout:
+                raise TimeoutError(
+                    f"Timeout waiting for TX queue to drain after {timeout} seconds"
+                )
             time.sleep(0.005)
+            current_qsize = self.poller.tx_queue.qsize()
+            if current_qsize < last_qsize:
+                last_progress = time.monotonic()
+            last_qsize = current_qsize
         self.check_upload_error()
 
-    def send_packet(self, packet: bytes) -> None:
+    def flush_tx(self, timeout: float = 10.0) -> None:
+        """Waits for queued TX blocks to drain, aborting on async upload errors."""
+        self._wait_tx_progress(target_max_qsize=0, timeout=timeout)
+
+    def send_packet(self, packet: bytes, tx_timeout: float = 10.0) -> None:
         """Sends a logical packet asynchronously without awaiting a reply."""
+        self._wait_tx_progress(target_max_qsize=MAX_TX_QUEUE_BLOCKS - 1, timeout=tx_timeout)
         with self._lock:
             blocks = self.splitter.split_message(packet)
             logger.debug(
-                "Enqueuing one-way packet opcode %#04x (%d bytes across %d blocks)",
+                "Enqueuing one-way packet opcode %#04x (%d bytes across %d blocks), hex=%s",
                 packet[0],
                 len(packet),
                 len(blocks),
+                packet[:128].hex(),
             )
             for block in blocks:
                 self.poller.enqueue_tx(block)
@@ -251,10 +280,11 @@ class SessionManager:
             # Split logical command into 64 KB blocks
             blocks = self.splitter.split_message(cmd_payload)
             logger.debug(
-                "Enqueuing command opcode %#04x (%d bytes across %d blocks)",
+                "Enqueuing command opcode %#04x (%d bytes across %d blocks), hex=%s",
                 cmd_payload[0],
                 len(cmd_payload),
                 len(blocks),
+                cmd_payload[:128].hex(),
             )
             for block in blocks:
                 self.poller.enqueue_tx(block)
@@ -322,6 +352,15 @@ class SessionManager:
                     continue
             return replies
 
+    def request_vnic_switch(self, is_router: bool = False, timeout: float = 5.0) -> bool:
+        """Negotiates switching from Transfer Line mode to Virtual NIC mode via 0x39."""
+        reply = self.send_command(encode_vnic_switch_request(), timeout=timeout)
+        decoded = decode_command(reply)
+        if decoded.get("extra_xml_command") != VNIC_CMD_ACCEPT_SWITCH:
+            return False
+        self.send_command(encode_vnic_switch_role(is_router=is_router), timeout=timeout)
+        return True
+
     def _dispatch_loop(self) -> None:
         """Background thread dequeuing RX blocks from poller and routing messages."""
         while self._running:
@@ -354,7 +393,17 @@ class SessionManager:
                 message[:128].hex(),
             )
 
-        # 1. Server Reply (0xA1..0xAC) -> routes to client waiting thread
+        # 1. Server Reply (0xA1..0xAC) or Extended XML response -> routes to client waiting thread
+        if opcode in OP_EXTENDED_XML_OPCODES:
+            decoded = decode_command(message)
+            if decoded.get("extra_xml_command") in (
+                VNIC_CMD_ACCEPT_SWITCH,
+                VNIC_CMD_REJECT_SWITCH,
+                "OK",
+            ):
+                self._reply_queue.put(message)
+                return
+
         if 0xA1 <= opcode <= 0xAC:
             if opcode == REPLY_UPLOAD_ERROR and len(message) == 9:
                 item_id, win32_err = struct.unpack_from("<II", message, 1)

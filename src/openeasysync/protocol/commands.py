@@ -269,8 +269,8 @@ def encode_file_chunk(
         "<BIIII",
         OP_FILE_CHUNK,
         item_id & 0xFFFFFFFF,
-        chunk_index & 0xFFFFFFFF,
         total_chunks & 0xFFFFFFFF,
+        chunk_index & 0xFFFFFFFF,
         len(chunk_data),
     )
     return header + chunk_data
@@ -502,6 +502,54 @@ def encode_extended_xml(opcode: int, xml_content: str) -> bytes:
     return bytes([opcode]) + xml_b
 
 
+VNIC_CMD_PLEASE_SWITCH = "PleaseSwitchAsVirtualNIC"
+VNIC_CMD_ACCEPT_SWITCH = "AcceptSwitchAsVirtualNIC"
+VNIC_CMD_REJECT_SWITCH = "RejectSwitchAsVirtualNIC"
+VNIC_CMD_ME_SWITCH_ROUTER = "MeSwitchAsRouter"
+VNIC_CMD_ME_SWITCH_NONE_ROUTER = "MeSwitchAsNoneRouter"
+
+
+def build_extra_xml_command(command: str, opcode: int = OP_EXTRA_XML) -> bytes:
+    """Encodes an `<ExtraXmlCommand>...</ExtraXmlCommand>` message (opcode 0x39)."""
+    return encode_extended_xml(opcode, f"<ExtraXmlCommand>{command}</ExtraXmlCommand>")
+
+
+def parse_extra_xml_command(xml_content: str) -> str | None:
+    """Extracts the command text from `<ExtraXmlCommand>...</ExtraXmlCommand>`."""
+    stripped = xml_content.strip()
+    if not stripped:
+        return None
+    start_tag = "<ExtraXmlCommand>"
+    end_tag = "</ExtraXmlCommand>"
+    start_idx = stripped.find(start_tag)
+    if start_idx != -1:
+        end_idx = stripped.find(end_tag, start_idx + len(start_tag))
+        if end_idx != -1:
+            return stripped[start_idx + len(start_tag) : end_idx].strip()
+    return None
+
+
+def encode_vnic_switch_request() -> bytes:
+    """Opcode 0x39: Initiates Virtual NIC mode-switch handshake."""
+    return build_extra_xml_command(VNIC_CMD_PLEASE_SWITCH)
+
+
+def encode_vnic_switch_accept() -> bytes:
+    """Opcode 0x39: Accepts a peer's Virtual NIC mode-switch request."""
+    return build_extra_xml_command(VNIC_CMD_ACCEPT_SWITCH)
+
+
+def encode_vnic_switch_reject() -> bytes:
+    """Opcode 0x39: Rejects a peer's Virtual NIC mode-switch request."""
+    return build_extra_xml_command(VNIC_CMD_REJECT_SWITCH)
+
+
+def encode_vnic_switch_role(is_router: bool = False) -> bytes:
+    """Opcode 0x39: Announces local router/standard role before switching to 0x0044."""
+    cmd = VNIC_CMD_ME_SWITCH_ROUTER if is_router else VNIC_CMD_ME_SWITCH_NONE_ROUTER
+    return build_extra_xml_command(cmd)
+
+
 # Decoders
 
 
@@ -607,7 +655,7 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
         }
 
     if opcode == OP_FILE_CHUNK:
-        item_id, chunk_index, total_chunks, chunk_len = struct.unpack_from("<IIII", payload, 1)
+        item_id, total_chunks, chunk_index, chunk_len = struct.unpack_from("<IIII", payload, 1)
         chunk_data = payload[17 : 17 + chunk_len]
         return {
             "opcode": OP_FILE_CHUNK,
@@ -707,6 +755,10 @@ def decode_command(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
             xml_str = payload[5 : 5 + xml_len].decode("ascii", errors="replace")
         else:
             xml_str = payload[1:].decode("ascii", errors="replace").rstrip("\x00")
-        return {"opcode": opcode, "xml": xml_str}
+        return {
+            "opcode": opcode,
+            "xml": xml_str,
+            "extra_xml_command": parse_extra_xml_command(xml_str),
+        }
 
     return {"opcode": opcode, "raw": payload}
