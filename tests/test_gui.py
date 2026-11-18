@@ -333,3 +333,132 @@ def test_main_window_local_pane_defaults_to_cwd(qapp, tmp_path, monkeypatch):
     assert win.local_pane.lbl_path.text() == str(tmp_path)
     win.close()
     win.deleteLater()
+
+
+def test_main_window_remote_mkdir_and_rename(qapp, tmp_path, monkeypatch):
+    """Verify MainWindow New Folder and Rename actions operate on the focused pane."""
+    from unittest.mock import MagicMock
+
+    local_file = tmp_path / "local.txt"
+    local_file.write_text("local", encoding="utf-8")
+
+    cable = MockBridgeCable()
+    t_a, _ = cable.create_pair()
+    session = SessionManager(t_a)
+    monkeypatch.setattr(SessionManager, "is_connected", property(lambda self: True))
+
+    win = MainWindow(session=session)
+    win.show()
+    win.local_current_path = str(tmp_path)
+    win.remote_current_path = "C:\\Remote"
+    win.refresh_local()
+    win.remote_pane.set_entries(
+        "C:\\Remote",
+        [
+            make_file_entry("remote.txt", size=12, is_dir=False),
+            make_file_entry("remote_dir", size=0, is_dir=True),
+        ],
+    )
+    win.local_pane.table.setCurrentCell(0, 0)
+    win.remote_pane.table.setCurrentCell(0, 0)
+
+    warn_mock = MagicMock()
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", warn_mock)
+    win.transfer.create_dir = MagicMock(return_value=True)
+    win.transfer.rename_file = MagicMock(return_value=True)
+    win.transfer.rename_dir = MagicMock(return_value=True)
+    win.refresh_remote = MagicMock()
+
+    # 1. Focus remote pane: New Folder creates remote directory
+    win.remote_pane.table.setFocus()
+    qapp.processEvents()
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *a, **kw: ("NewFolder", True))
+    win.act_mkdir.trigger()
+    win.transfer.create_dir.assert_called_once_with("C:\\Remote\\NewFolder")
+    win.refresh_remote.assert_called_once()
+
+    # 2. Focus remote pane on file: Rename calls rename_file
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *a, **kw: ("renamed.txt", True))
+    win.act_rename.trigger()
+    win.transfer.rename_file.assert_called_once_with(
+        "C:\\Remote\\remote.txt", "C:\\Remote\\renamed.txt"
+    )
+    win.transfer.rename_dir.assert_not_called()
+
+    # 3. Focus remote pane on dir: Rename calls rename_dir
+    win.remote_pane.table.setCurrentCell(1, 0)
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *a, **kw: ("renamed_dir", True))
+    win.act_rename.trigger()
+    win.transfer.rename_dir.assert_called_once_with(
+        "C:\\Remote\\remote_dir", "C:\\Remote\\renamed_dir"
+    )
+
+    # 4. Focus local pane: New Folder & Rename operate locally, not remotely
+    win.transfer.create_dir.reset_mock()
+    win.transfer.rename_file.reset_mock()
+    win.transfer.rename_dir.reset_mock()
+    win.local_pane.table.setFocus()
+    qapp.processEvents()
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *a, **kw: ("local_sub", True))
+    win.act_mkdir.trigger()
+    assert (tmp_path / "local_sub").is_dir()
+    win.transfer.create_dir.assert_not_called()
+
+    # Select local.txt (may be row 0 or 1 after sorting with local_sub)
+    for r in range(win.local_pane.table.rowCount()):
+        if win.local_pane.table.item(r, 0).text() == "local.txt":
+            win.local_pane.table.setCurrentCell(r, 0)
+            break
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *a, **kw: ("local_renamed.txt", True))
+    win.act_rename.trigger()
+    assert not local_file.exists()
+    assert (tmp_path / "local_renamed.txt").is_file()
+    win.transfer.rename_file.assert_not_called()
+    warn_mock.assert_not_called()
+
+    win.close()
+    win.deleteLater()
+
+
+def test_main_window_remote_navigate_notifies_active_dir(qapp, monkeypatch):
+    """Verify navigating remote directories calls TransferManager.notify_active_dir."""
+    from unittest.mock import MagicMock
+
+    cable = MockBridgeCable()
+    t_a, _ = cable.create_pair()
+    session = SessionManager(t_a)
+    monkeypatch.setattr(SessionManager, "is_connected", property(lambda self: True))
+
+    win = MainWindow(session=session)
+    win.show()
+    win.transfer.notify_active_dir = MagicMock(return_value=True)
+    win.refresh_remote = MagicMock()
+
+    win._on_remote_navigate("C:\\Remote\\Sub")
+    win.transfer.notify_active_dir.assert_called_once_with("C:\\Remote\\Sub")
+    win.refresh_remote.assert_called_once()
+
+    win.remote_pane.table.setFocus()
+    qapp.processEvents()
+    win.act_up.trigger()
+    assert win.remote_current_path == "C:\\Remote"
+    win.transfer.notify_active_dir.assert_called_with("C:\\Remote")
+
+    win.close()
+    win.deleteLater()
+
+
+def test_main_window_remote_context_menu_actions(qapp):
+    """Verify remote pane context menu exposes New Folder, Rename, and Delete actions."""
+    from PySide6.QtCore import Qt
+
+    win = MainWindow()
+    assert win.remote_pane.table.contextMenuPolicy() == Qt.CustomContextMenu
+
+    menu = win._build_remote_context_menu()
+    assert [act.text() for act in menu.actions()] == ["New Folder", "Rename", "Delete"]
+
+    menu.deleteLater()
+    win.close()
+    win.deleteLater()

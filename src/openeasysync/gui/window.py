@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QSplitter,
     QStatusBar,
@@ -220,6 +221,8 @@ class MainWindow(QMainWindow):
         self.remote_pane.focused.connect(lambda: self._set_focused_pane(self.remote_pane))
         self.local_pane.navigate_requested.connect(self._on_local_navigate)
         self.remote_pane.navigate_requested.connect(self._on_remote_navigate)
+        self.remote_pane.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.remote_pane.table.customContextMenuRequested.connect(self._on_remote_context_menu)
 
         splitter.addWidget(self.local_pane)
         splitter.addWidget(self.remote_pane)
@@ -252,6 +255,9 @@ class MainWindow(QMainWindow):
         self.act_mkdir = toolbar.addAction("New Folder")
         self.act_mkdir.triggered.connect(self._on_mkdir_clicked)
 
+        self.act_rename = toolbar.addAction("Rename")
+        self.act_rename.triggered.connect(self._on_rename_clicked)
+
         # Toolbar Hardware status indicator lamps
         toolbar.addSeparator()
         self.lamp_usb11_l = StatusLamp("USB 1.1 L", active_color="#e67e22")
@@ -276,6 +282,7 @@ class MainWindow(QMainWindow):
         m_file.addSeparator()
         m_file.addAction(self.act_delete)
         m_file.addAction(self.act_mkdir)
+        m_file.addAction(self.act_rename)
         m_file.addSeparator()
         act_exit = m_file.addAction("E&xit")
         act_exit.triggered.connect(self.close)
@@ -368,8 +375,18 @@ class MainWindow(QMainWindow):
             self.local_current_path = os.path.abspath(new_path)
             self.refresh_local()
 
+    def _notify_remote_active_dir(self, remote_path: str) -> None:
+        """Notifies the remote peer of the active remote directory if connected."""
+        if not self.transfer or not self.session or not self.session.is_connected:
+            return
+        try:
+            self.transfer.notify_active_dir(remote_path)
+        except Exception:
+            pass
+
     def _on_remote_navigate(self, new_path: str) -> None:
         self.remote_current_path = new_path
+        self._notify_remote_active_dir(new_path)
         self.refresh_remote()
 
     def _set_focused_pane(self, pane: FilePane) -> None:
@@ -406,6 +423,7 @@ class MainWindow(QMainWindow):
                 else:
                     parent_r = posixpath.dirname(clean_r)
                     self.remote_current_path = "" if parent_r == clean_r else parent_r
+                self._notify_remote_active_dir(self.remote_current_path)
                 self.refresh_remote()
 
     def _on_refresh_clicked(self) -> None:
@@ -620,6 +638,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Delete Error", str(exc))
 
     def _on_mkdir_clicked(self) -> None:
+        focused = self._get_focused_pane()
+        if focused is self.remote_pane:
+            self._create_remote_dir()
+        else:
+            self._create_local_dir()
+
+    def _create_local_dir(self) -> None:
         name, ok = QInputDialog.getText(self, "New Folder", "Enter folder name:")
         if ok and name:
             new_dir = os.path.join(self.local_current_path, name)
@@ -628,6 +653,90 @@ class MainWindow(QMainWindow):
                 self.refresh_local()
             except Exception as exc:
                 QMessageBox.warning(self, "Create Folder Error", str(exc))
+
+    def _create_remote_dir(self) -> None:
+        if not self.transfer or not self.session or not self.session.is_connected:
+            QMessageBox.warning(self, "Create Folder Error", "Remote peer is not connected.")
+            return
+        name, ok = QInputDialog.getText(self, "New Folder", "Enter folder name:")
+        if not ok or not name:
+            return
+        remote_path = self._build_remote_path(name)
+        try:
+            if self.transfer.create_dir(remote_path):
+                self.refresh_remote()
+            else:
+                QMessageBox.warning(
+                    self, "Create Folder Error", f"Failed to create '{name}'."
+                )
+        except Exception as exc:
+            QMessageBox.warning(self, "Create Folder Error", str(exc))
+
+    def _on_rename_clicked(self) -> None:
+        focused = self._get_focused_pane()
+        if focused is self.remote_pane:
+            self._rename_remote_selected()
+        elif focused is self.local_pane:
+            self._rename_local_selected()
+
+    def _rename_local_selected(self) -> None:
+        loc_entry = self.local_pane.get_selected_entry()
+        if not loc_entry:
+            return
+        old_name = loc_entry.find_data.filename
+        new_name, ok = QInputDialog.getText(self, "Rename", "Enter new name:", text=old_name)
+        if not ok or not new_name or new_name == old_name:
+            return
+        old_path = os.path.join(self.local_current_path, old_name)
+        new_path = os.path.join(self.local_current_path, new_name)
+        try:
+            os.rename(old_path, new_path)
+            self.refresh_local()
+        except Exception as exc:
+            QMessageBox.warning(self, "Rename Error", str(exc))
+
+    def _rename_remote_selected(self) -> None:
+        rem_entry = self.remote_pane.get_selected_entry()
+        if not rem_entry:
+            return
+        if rem_entry.is_drive:
+            QMessageBox.warning(self, "Rename Error", "Cannot rename a drive.")
+            return
+        if not self.transfer or not self.session or not self.session.is_connected:
+            QMessageBox.warning(self, "Rename Error", "Remote peer is not connected.")
+            return
+        old_name = rem_entry.find_data.filename
+        new_name, ok = QInputDialog.getText(self, "Rename", "Enter new name:", text=old_name)
+        if not ok or not new_name or new_name == old_name:
+            return
+        old_path = self._build_remote_path(old_name)
+        new_path = self._build_remote_path(new_name)
+        try:
+            if rem_entry.is_dir:
+                renamed = self.transfer.rename_dir(old_path, new_path)
+            else:
+                renamed = self.transfer.rename_file(old_path, new_path)
+            if renamed:
+                self.refresh_remote()
+            else:
+                QMessageBox.warning(self, "Rename Error", f"Failed to rename '{old_name}'.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Rename Error", str(exc))
+
+    def _build_remote_context_menu(self) -> QMenu:
+        menu = QMenu(self)
+        act_new_folder = menu.addAction("New Folder")
+        act_new_folder.triggered.connect(self._create_remote_dir)
+        act_rename = menu.addAction("Rename")
+        act_rename.triggered.connect(self._rename_remote_selected)
+        act_delete = menu.addAction("Delete")
+        act_delete.triggered.connect(self._delete_remote_selected)
+        return menu
+
+    def _on_remote_context_menu(self, pos) -> None:
+        self._set_focused_pane(self.remote_pane)
+        menu = self._build_remote_context_menu()
+        menu.exec(self.remote_pane.table.viewport().mapToGlobal(pos))
 
     def _show_about(self) -> None:
         dlg = AboutDialog(self)
