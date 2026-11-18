@@ -38,12 +38,17 @@ class MockBridgeCable:
         speed_b: int = SPEED_USB20,
         initial_mode_a: int = MODE_TRANSFER_LINE,
         initial_mode_b: int = MODE_TRANSFER_LINE,
+        fw_rev: int = 3,
+        buffer_size_code: int = 4,
+        custom_buffer_size: int | None = None,
     ):
         self.lock = threading.RLock()
         self.speed = {"A": speed_a, "B": speed_b}
         self.mode = {"A": initial_mode_a, "B": initial_mode_b}
         self.timeout = {"A": 4000, "B": 4000}
-        self.buffer_size_code = 4  # 512 KB
+        self.fw_rev = fw_rev
+        self.buffer_size_code = buffer_size_code  # default 4 = 512 KB
+        self.custom_buffer_size = custom_buffer_size
 
         # FIFO queues: A -> B and B -> A
         self.queue_a_to_b: queue.Queue[bytes] = queue.Queue(maxsize=32)
@@ -94,8 +99,8 @@ class MockTransport(TransportBackend):
 
         # 2. 0xF0 Identify OTi-2108
         if opcode == 0xF0:
-            # 12-byte golden response: Chip 2108, rev 3, date "030729"
-            resp = bytes.fromhex("000021080003303330373239")
+            # 12-byte response: Chip 2108, configurable fw_rev (default 3), date "030729"
+            resp = b"\x00\x00\x21\x08\x00" + bytes([self.bridge.fw_rev & 0xFF]) + b"030729"
             return CSW_STATUS_PASSED, resp, (0, 0, 0)
 
         # 3. 0xD8 0x00 Read Register / Poll
@@ -180,6 +185,19 @@ class MockTransport(TransportBackend):
                 return CSW_STATUS_PASSED, block[:read_len], (0, 0, 0)
             except queue.Empty:
                 return CSW_STATUS_FAILED, b"", (0x09, 0x81, 0x00)  # Peer Timeout
+
+        # 7. 0xDB 0x28 Vendor Flash / Config Sector Read
+        if opcode == 0xDB and cdb[1] == 0x28:
+            addr = (cdb[4] << 8) | cdb[5]
+            cnt = (cdb[7] << 8) | cdb[8]
+            total_len = max(1, cnt) * 512
+            buf = bytearray(total_len)
+            with self.bridge.lock:
+                if addr == 0x0022 and self.bridge.custom_buffer_size is not None:
+                    buf[0:7] = b"OTiMing"
+                    struct.pack_into("<I", buf, 8, self.bridge.custom_buffer_size)
+            req_len = int(data_or_length) if direction == "IN" else total_len
+            return CSW_STATUS_PASSED, bytes(buf[:req_len]), (0, 0, 0)
 
         # Unknown CDB
         return CSW_STATUS_FAILED, b"", (0x05, 0x20, 0x00)  # Invalid opcode

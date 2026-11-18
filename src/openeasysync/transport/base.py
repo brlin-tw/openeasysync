@@ -75,11 +75,13 @@ class TransportBackend(ABC):
 
         fw_rev = data[5]
         fw_date = data[6:12].decode("ascii", errors="replace")
+        extended_cap = fw_rev > 2
+        self._extended_cap = extended_cap
         return {
             "chip_id": "OTi-2108",
             "fw_rev": fw_rev,
             "fw_date": fw_date,
-            "extended_cap": (fw_rev > 2),
+            "extended_cap": extended_cap,
         }
 
     def test_unit_ready(self, timeout_ms: int = 2000) -> bool:
@@ -135,10 +137,48 @@ class TransportBackend(ABC):
         peer_spd = data[1] if len(data) > 1 else 0
         return local_spd, peer_spd
 
-    def get_buffer_size(self, timeout_ms: int = 2000) -> int:
-        """Queries bridge buffer size."""
+    def read_flash_config(
+        self, addr: int = 0x0022, count: int = 1, timeout_ms: int = 2000
+    ) -> bytes:
+        """Issues CDB 0xDB 0x28 (Vendor Flash / Config Sector Read)."""
+        addr_bytes = struct.pack(">H", addr & 0xFFFF)
+        cnt_bytes = struct.pack(">H", count & 0xFFFF)
+        cdb = (
+            bytes([0xDB, 0x28, 0x00, 0x00])
+            + addr_bytes
+            + bytes([0x00])
+            + cnt_bytes
+            + bytes(5)
+            + b"OT"
+        )
+        status, data, sense = self.execute_cdb(cdb, "IN", count * 512, timeout_ms=timeout_ms)
+        if status != CSW_STATUS_PASSED:
+            _, _, desc = decode_sense_code(*sense)
+            raise OSError(f"Flash config read addr={addr:#06x} failed: status={status}, {desc}")
+        return data
+
+    def query_buffer_size(
+        self, timeout_ms: int = 2000, extended_cap: bool | None = None
+    ) -> int:
+        """Queries bridge buffer size, including 0xDB 0x28 OTiMing flash lookup when size_code == 0."""
         data = self.read_status(OPTYPE_BUFFER_SIZE, timeout_ms=timeout_ms)
         code = data[1] if len(data) > 1 else 4
+        if code == 0:
+            if extended_cap is None:
+                extended_cap = getattr(self, "_extended_cap", None)
+            if extended_cap is None:
+                extended_cap = self.identify(timeout_ms=timeout_ms)["extended_cap"]
+            if extended_cap:
+                try:
+                    flash = self.read_flash_config(addr=0x0022, count=1, timeout_ms=timeout_ms)
+                    if len(flash) >= 12 and flash[0:7] == b"OTiMing":
+                        custom_size = struct.unpack_from("<I", flash, 8)[0]
+                        if custom_size > 0:
+                            return custom_size
+                except OSError:
+                    pass
+            return 0x80000
+
         size_map = {
             1: 256 * 1024,
             2: 256 * 1024,
@@ -148,6 +188,12 @@ class TransportBackend(ABC):
             6: 2048 * 1024,
         }
         return size_map.get(code, 512 * 1024)
+
+    def get_buffer_size(
+        self, timeout_ms: int = 2000, extended_cap: bool | None = None
+    ) -> int:
+        """Queries bridge buffer size."""
+        return self.query_buffer_size(timeout_ms=timeout_ms, extended_cap=extended_cap)
 
     def get_peer_mode(self, timeout_ms: int = 2000) -> int:
         """Queries peer operating mode (0x007F, 0x0044, or 0x0000)."""

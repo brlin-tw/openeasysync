@@ -160,3 +160,84 @@ def test_pyusb_transport_data_stall_and_recovery():
     # Test reset_recovery
     transport.reset_recovery()
     mock_dev.ctrl_transfer.assert_called_with(0x21, 0xFF, 0x0000, 0, b"", timeout=1000)
+
+
+def test_read_flash_config_cdb_layout():
+    """Verify CDB 0xDB 0x28 layout matches spec section 3.2.7."""
+    from openeasysync.transport.base import TransportBackend
+
+    class DummyTransport(TransportBackend):
+        def __init__(self):
+            self.calls = []
+
+        def execute_cdb(self, cdb, direction, data_or_length=0, timeout_ms=5000):
+            self.calls.append((cdb, direction, data_or_length, timeout_ms))
+            return CSW_STATUS_PASSED, bytes(512), (0, 0, 0)
+
+        def close(self):
+            pass
+
+    t = DummyTransport()
+    data = t.read_flash_config(addr=0x0022, count=1, timeout_ms=3000)
+    assert len(data) == 512
+    assert len(t.calls) == 1
+    cdb, direction, length, timeout_ms = t.calls[0]
+    assert len(cdb) == 16
+    assert cdb == bytes.fromhex("DB280000002200000100000000004F54")
+    assert direction == "IN"
+    assert length == 512
+    assert timeout_ms == 3000
+
+
+def test_query_buffer_size_otiming_custom_lookup():
+    """Verify fw_rev > 2 and size_code == 0 triggers 0xDB 0x28 OTiMing lookup."""
+    cable = MockBridgeCable(fw_rev=3, buffer_size_code=0, custom_buffer_size=0x180000)
+    host_a, host_b = cable.create_pair()
+    try:
+        info = host_a.identify()
+        assert info["extended_cap"] is True
+        assert host_a.query_buffer_size() == 0x180000
+        assert host_a.get_buffer_size() == 0x180000
+    finally:
+        host_a.close()
+        host_b.close()
+
+
+def test_query_buffer_size_fallback_without_otiming():
+    """Verify size_code == 0 without OTiMing signature falls back to 0x80000."""
+    cable = MockBridgeCable(fw_rev=3, buffer_size_code=0, custom_buffer_size=None)
+    host_a, host_b = cable.create_pair()
+    try:
+        host_a.identify()
+        assert host_a.query_buffer_size() == 0x80000
+    finally:
+        host_a.close()
+        host_b.close()
+
+
+def test_query_buffer_size_skips_db28_when_fw_rev_le_2():
+    """Verify fw_rev <= 2 with size_code == 0 does not issue 0xDB 0x28 and returns 0x80000."""
+    from unittest.mock import patch
+
+    cable = MockBridgeCable(fw_rev=2, buffer_size_code=0, custom_buffer_size=0x180000)
+    host_a, host_b = cable.create_pair()
+    try:
+        info = host_a.identify()
+        assert info["extended_cap"] is False
+        with patch.object(host_a, "read_flash_config", wraps=host_a.read_flash_config) as spy:
+            assert host_a.query_buffer_size() == 0x80000
+            spy.assert_not_called()
+    finally:
+        host_a.close()
+        host_b.close()
+
+
+def test_query_buffer_size_auto_identifies_if_needed():
+    """Verify query_buffer_size calls identify() when extended_cap is not yet known."""
+    cable = MockBridgeCable(fw_rev=3, buffer_size_code=0, custom_buffer_size=0x200000)
+    host_a, host_b = cable.create_pair()
+    try:
+        assert host_a.query_buffer_size() == 0x200000
+    finally:
+        host_a.close()
+        host_b.close()
