@@ -252,8 +252,8 @@ def cmd_get(args) -> int:
         session.disconnect()
 
 
-def cmd_rm(args) -> int:
-    """Deletes a file on the remote peer."""
+def _run_remote_transfer_op(args, op_fn) -> int:
+    """Connects to the OTi-2108 peer, runs a TransferManager operation, and disconnects."""
     device_spec = getattr(args, "device", None)
     transport = detect_device(device_spec)
     if not transport:
@@ -265,20 +265,58 @@ def cmd_rm(args) -> int:
     transfer = TransferManager(session)
 
     try:
-        remote_p = args.remote_path
-        print(f"Deleting '{remote_p}'...")
-        success = transfer.delete_file(remote_p)
-        if success:
-            print("File deleted successfully.")
-            return 0
-        else:
-            print(f"Failed to delete '{remote_p}'.", file=sys.stderr)
-            return 1
+        return op_fn(transfer)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:
         session.disconnect()
+
+
+def cmd_rm(args) -> int:
+    """Deletes a file on the remote peer."""
+    remote_p = args.remote_path
+
+    def _op(transfer: TransferManager) -> int:
+        print(f"Deleting '{remote_p}'...")
+        if transfer.delete_file(remote_p):
+            print("File deleted successfully.")
+            return 0
+        print(f"Failed to delete '{remote_p}'.", file=sys.stderr)
+        return 1
+
+    return _run_remote_transfer_op(args, _op)
+
+
+def cmd_mkdir(args) -> int:
+    """Creates a directory on the remote peer."""
+    remote_p = args.remote_path
+
+    def _op(transfer: TransferManager) -> int:
+        print(f"Creating directory '{remote_p}'...")
+        if transfer.create_dir(remote_p):
+            print("Directory created successfully.")
+            return 0
+        print(f"Failed to create directory '{remote_p}'.", file=sys.stderr)
+        return 1
+
+    return _run_remote_transfer_op(args, _op)
+
+
+def cmd_mv(args) -> int:
+    """Renames or moves a file or directory on the remote peer."""
+    old_p = args.old_path
+    new_p = args.new_path
+
+    def _op(transfer: TransferManager) -> int:
+        print(f"Renaming '{old_p}' -> '{new_p}'...")
+        if transfer.rename_file(old_p, new_p):
+            print("Renamed successfully.")
+            return 0
+        print(f"Failed to rename '{old_p}' to '{new_p}'.", file=sys.stderr)
+        return 1
+
+    return _run_remote_transfer_op(args, _op)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -347,6 +385,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_rm.add_argument("remote_path", help="Remote file path to delete")
     p_rm.set_defaults(func=cmd_rm)
+
+    # mkdir
+    p_mkdir = subparsers.add_parser("mkdir", help="Create a directory on remote peer")
+    p_mkdir.add_argument("remote_path", help="Remote directory path to create")
+    p_mkdir.set_defaults(func=cmd_mkdir)
+
+    # mv
+    p_mv = subparsers.add_parser(
+        "mv", aliases=["rename"], help="Rename or move a file or directory on remote peer"
+    )
+    p_mv.add_argument("old_path", help="Remote source path")
+    p_mv.add_argument("new_path", help="Remote destination path")
+    p_mv.set_defaults(func=cmd_mv)
 
     parsed_args = parser.parse_args(argv)
     if parsed_args.debug:

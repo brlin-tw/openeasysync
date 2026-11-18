@@ -166,3 +166,152 @@ def test_cli_put_force_overwrite_flag(tmp_path):
 
         assert main(["put", "--force", str(local_file), "C:\\demo.bin"]) == 0
         assert mock_transfer.upload_file.call_args.kwargs["overwrite"] is True
+
+
+def test_cli_mkdir_success():
+    """Verify 'mkdir' command creates a remote directory and disconnects session."""
+    mock_transport = MagicMock()
+    mock_session = MagicMock()
+    mock_transfer = MagicMock()
+    mock_transfer.create_dir.return_value = True
+
+    with (
+        patch("openeasysync.cli.main.detect_device", return_value=mock_transport) as mock_detect,
+        patch("openeasysync.cli.main.SessionManager", return_value=mock_session),
+        patch("openeasysync.cli.main.TransferManager", return_value=mock_transfer),
+    ):
+        rc = main(["-d", "1:4", "mkdir", "C:\\NewFolder"])
+
+    assert rc == 0
+    mock_detect.assert_called_once_with("1:4")
+    mock_session.connect.assert_called_once()
+    mock_transfer.create_dir.assert_called_once_with("C:\\NewFolder")
+    mock_session.disconnect.assert_called_once()
+
+
+def test_cli_mkdir_failure_status():
+    """Verify 'mkdir' returns exit code 1 when create_dir returns False."""
+    mock_transport = MagicMock()
+    mock_session = MagicMock()
+    mock_transfer = MagicMock()
+    mock_transfer.create_dir.return_value = False
+
+    with (
+        patch("openeasysync.cli.main.detect_device", return_value=mock_transport),
+        patch("openeasysync.cli.main.SessionManager", return_value=mock_session),
+        patch("openeasysync.cli.main.TransferManager", return_value=mock_transfer),
+    ):
+        rc = main(["mkdir", "C:\\NewFolder"])
+
+    assert rc == 1
+    mock_session.disconnect.assert_called_once()
+
+
+def test_cli_mkdir_no_device():
+    """Verify 'mkdir' returns exit code 1 when no OTi-2108 device is detected."""
+    with patch("openeasysync.cli.main.detect_device", return_value=None):
+        rc = main(["mkdir", "C:\\NewFolder"])
+
+    assert rc == 1
+
+
+def test_cli_mkdir_exception_disconnects():
+    """Verify 'mkdir' returns exit code 1 and disconnects on exception."""
+    mock_transport = MagicMock()
+    mock_session = MagicMock()
+    mock_transfer = MagicMock()
+    mock_transfer.create_dir.side_effect = RuntimeError("transport error")
+
+    with (
+        patch("openeasysync.cli.main.detect_device", return_value=mock_transport),
+        patch("openeasysync.cli.main.SessionManager", return_value=mock_session),
+        patch("openeasysync.cli.main.TransferManager", return_value=mock_transfer),
+    ):
+        rc = main(["mkdir", "C:\\NewFolder"])
+
+    assert rc == 1
+    mock_session.disconnect.assert_called_once()
+
+
+def test_cli_mv_success():
+    """Verify 'mv' command renames a remote path and disconnects session."""
+    mock_transport = MagicMock()
+    mock_session = MagicMock()
+    mock_transfer = MagicMock()
+    mock_transfer.rename_file.return_value = True
+
+    with (
+        patch("openeasysync.cli.main.detect_device", return_value=mock_transport) as mock_detect,
+        patch("openeasysync.cli.main.SessionManager", return_value=mock_session),
+        patch("openeasysync.cli.main.TransferManager", return_value=mock_transfer),
+    ):
+        rc = main(["-d", "1:4", "mv", "C:\\old.txt", "C:\\new.txt"])
+
+    assert rc == 0
+    mock_detect.assert_called_once_with("1:4")
+    mock_session.connect.assert_called_once()
+    mock_transfer.rename_file.assert_called_once_with("C:\\old.txt", "C:\\new.txt")
+    mock_session.disconnect.assert_called_once()
+
+
+def test_cli_rename_alias_success():
+    """Verify 'rename' alias invokes the same remote rename handler."""
+    mock_transport = MagicMock()
+    mock_session = MagicMock()
+    mock_transfer = MagicMock()
+    mock_transfer.rename_file.return_value = True
+
+    with (
+        patch("openeasysync.cli.main.detect_device", return_value=mock_transport),
+        patch("openeasysync.cli.main.SessionManager", return_value=mock_session),
+        patch("openeasysync.cli.main.TransferManager", return_value=mock_transfer),
+    ):
+        rc = main(["rename", "C:\\old_dir", "C:\\new_dir"])
+
+    assert rc == 0
+    mock_transfer.rename_file.assert_called_once_with("C:\\old_dir", "C:\\new_dir")
+    mock_session.disconnect.assert_called_once()
+
+
+def test_cli_mv_failure_status():
+    """Verify 'mv' returns exit code 1 when rename_file returns False."""
+    mock_transport = MagicMock()
+    mock_session = MagicMock()
+    mock_transfer = MagicMock()
+    mock_transfer.rename_file.return_value = False
+
+    with (
+        patch("openeasysync.cli.main.detect_device", return_value=mock_transport),
+        patch("openeasysync.cli.main.SessionManager", return_value=mock_session),
+        patch("openeasysync.cli.main.TransferManager", return_value=mock_transfer),
+    ):
+        rc = main(["mv", "C:\\missing.txt", "C:\\new.txt"])
+
+    assert rc == 1
+    mock_session.disconnect.assert_called_once()
+
+
+def test_cli_mv_no_device():
+    """Verify 'mv' returns exit code 1 when no OTi-2108 device is detected."""
+    with patch("openeasysync.cli.main.detect_device", return_value=None):
+        rc = main(["mv", "C:\\old.txt", "C:\\new.txt"])
+
+    assert rc == 1
+
+
+def test_cli_mv_exception_disconnects():
+    """Verify 'mv' returns exit code 1 and disconnects on exception."""
+    mock_transport = MagicMock()
+    mock_session = MagicMock()
+    mock_transfer = MagicMock()
+    mock_transfer.rename_file.side_effect = RuntimeError("transport error")
+
+    with (
+        patch("openeasysync.cli.main.detect_device", return_value=mock_transport),
+        patch("openeasysync.cli.main.SessionManager", return_value=mock_session),
+        patch("openeasysync.cli.main.TransferManager", return_value=mock_transfer),
+    ):
+        rc = main(["mv", "C:\\old.txt", "C:\\new.txt"])
+
+    assert rc == 1
+    mock_session.disconnect.assert_called_once()
