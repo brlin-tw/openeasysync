@@ -35,6 +35,7 @@ from openeasysync.protocol.commands import (
     default_peer_flags,
     encode_abort_batch,
     encode_abort_upload,
+    encode_batch_clear_readonly,
     encode_create_batch_zero_files,
     encode_create_dir,
     encode_delete_dir,
@@ -473,6 +474,7 @@ class TransferManager:
         remote_base_dir: str,
         conflict_resolver: Callable[[str, Win32FindData | None], str] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
+        overwrite: bool = True,
     ) -> bool:
         """Recursively batch uploads multiple files/directories into remote_base_dir (Opcode 0x0B)."""
         records: list[BatchUploadRecord] = []
@@ -522,8 +524,8 @@ class TransferManager:
                 )
                 records.append(BatchUploadRecord(rel_path=fn, find_data=fd_f, data=data))
 
-        # Check conflicts if conflict_resolver is provided
-        if conflict_resolver and records:
+        # Pre-check disk space and conflicts (0x16), and clear read-only on overwritten targets (0x12)
+        if records:
             precheck_items: list[tuple[int, str]] = []
             id_to_record: dict[int, BatchUploadRecord] = {}
             total_size = 0
@@ -548,17 +550,32 @@ class TransferManager:
                     raise OSError("Insufficient disk space on remote peer")
                 conflict_ids = set(rep["conflict_item_ids"])
                 filtered_records = []
-                for item_id, _target in precheck_items:
+                clear_readonly_items: list[tuple[int, str]] = []
+                for item_id, target in precheck_items:
                     r = id_to_record[item_id]
                     if item_id in conflict_ids:
-                        action = conflict_resolver(r.rel_path, None)
-                        if action.lower() in ("overwrite", "yes", "all"):
+                        if conflict_resolver:
+                            action = conflict_resolver(r.rel_path, None)
+                            if action.lower() in ("overwrite", "yes", "all"):
+                                filtered_records.append(r)
+                                clear_readonly_items.append((item_id, target))
+                            elif action.lower() in ("cancel", "abort"):
+                                return False
+                        elif overwrite:
                             filtered_records.append(r)
-                        elif action.lower() in ("cancel", "abort"):
-                            return False
+                            clear_readonly_items.append((item_id, target))
                     else:
                         filtered_records.append(r)
                 records = filtered_records
+                if clear_readonly_items:
+                    clr_cmd = encode_batch_clear_readonly(
+                        clear_readonly_items, req_id=self._get_next_item_id()
+                    )
+                    clr_rep = decode_reply(
+                        self.session.send_command(clr_cmd, expected_opcodes=(REPLY_STATUS_ACK,))
+                    )
+                    if clr_rep.get("status") != STATUS_OK:
+                        return False
 
         total_bytes = sum(r.find_data.file_size for r in records if not r.find_data.is_directory)
         transferred_bytes = 0
@@ -583,7 +600,10 @@ class TransferManager:
                     else None
                 )
                 if not self._upload_bytes(
-                    remote_target, rec.data, overwrite=True, progress_callback=file_cb
+                    remote_target,
+                    rec.data,
+                    overwrite=overwrite or bool(conflict_resolver),
+                    progress_callback=file_cb,
                 ):
                     return False
                 transferred_bytes += rec.find_data.file_size
