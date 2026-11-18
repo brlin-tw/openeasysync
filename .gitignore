@@ -103,3 +103,6 @@ dist/
 # Don't track unpacked product files
 /openeasysync-*/
 crash dump/
+
+# Don't track packet capture files
+*.pcap
