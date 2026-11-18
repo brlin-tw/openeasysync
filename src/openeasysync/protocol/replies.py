@@ -133,7 +133,7 @@ def encode_download_chunk(
 ) -> bytes:
     """Opcode 0xA3: File Download Data Chunk."""
     header = bytes([REPLY_DOWNLOAD_CHUNK]) + struct.pack(
-        "<IIII", item_id & 0xFFFFFFFF, chunk_index, total_chunks, len(chunk_data)
+        "<IIII", item_id & 0xFFFFFFFF, total_chunks, chunk_index, len(chunk_data)
     )
     return header + chunk_data
 
@@ -378,7 +378,7 @@ def decode_reply(payload: bytes, encoding: str = "utf-8") -> dict[str, Any]:
 
     if opcode == REPLY_DOWNLOAD_CHUNK:
         if len(payload) >= 17:
-            item_id, chunk_index, total_chunks, data_len = struct.unpack_from("<IIII", payload, 1)
+            item_id, total_chunks, chunk_index, data_len = struct.unpack_from("<IIII", payload, 1)
             chunk_data = payload[17 : 17 + data_len]
             return {
                 "opcode": REPLY_DOWNLOAD_CHUNK,
