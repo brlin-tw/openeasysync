@@ -514,3 +514,79 @@ def test_e2e_batch_upload_and_download_progress_callbacks(dual_host_setup):
     assert dl_calls[-1][0] == total_expected
     assert dl_calls[-1][1] == total_expected
     assert [c[0] for c in dl_calls] == sorted(c[0] for c in dl_calls)
+
+
+def test_server_handler_emits_0xa9_on_batch_chunk_write_failure(tmp_path):
+    """Verify PeerServerHandler emits 0xA9 on batch chunk write failures and SessionManager catches it."""
+    import errno
+    import struct
+    from unittest.mock import MagicMock
+
+    from openeasysync.constants import (
+        OP_UPLOAD_SINGLE,
+        REPLY_UPLOAD_BATCH_ERROR,
+        REPLY_UPLOAD_ERROR,
+    )
+    from openeasysync.protocol.commands import (
+        encode_file_chunk,
+        encode_precheck_batch_ext,
+        encode_upload_single,
+    )
+    from openeasysync.protocol.path_mapping import PathMapper
+    from openeasysync.protocol.replies import decode_reply
+    from openeasysync.server.handler import PeerServerHandler
+
+    handler = PeerServerHandler(PathMapper(virtual_root=str(tmp_path)))
+
+    def _failing_file(exc: Exception) -> MagicMock:
+        f = MagicMock()
+        f.write.side_effect = exc
+        return f
+
+    # 1. Batch precheck followed by OP_UPLOAD_SINGLE and failing OP_FILE_CHUNK -> 0xA9
+    precheck_pkt = encode_precheck_batch_ext(
+        [(101, "C:\\batch\\file1.bin")], req_id=100, total_size=1024
+    )
+    handler.handle_command(precheck_pkt)
+
+    upload_pkt = encode_upload_single("C:\\batch\\file1.bin", file_size=1024, req_id=201, overwrite=True)
+    handler.handle_command(upload_pkt)
+    handler._active_uploads[201]["file"].close()
+    handler._active_uploads[201]["file"] = _failing_file(OSError(errno.ENOSPC, "No space"))
+
+    replies = handler.handle_command(encode_file_chunk(item_id=201, chunk_index=1, total_chunks=1, chunk_data=b"abc"))
+    assert len(replies) == 1
+    assert replies[0][0] == REPLY_UPLOAD_BATCH_ERROR
+    parsed = decode_reply(replies[0])
+    assert parsed["opcode"] == REPLY_UPLOAD_BATCH_ERROR
+    assert parsed["item_id"] == 201
+    assert parsed["win32_error"] == 112
+    assert parsed["status"] == 1
+
+    # Feed emitted 0xA9 into SessionManager._route_message and verify check_upload_error() raises
+    session = SessionManager(MagicMock())
+    session._route_message(replies[0])
+    with pytest.raises(OSError, match="Batch upload write error"):
+        session.check_upload_error()
+
+    # 2. OP_UPLOAD_SINGLE with batch flag (0x02) and failing chunk -> 0xA9
+    dest2 = "C:\\batch_flag.bin"
+    dest2_b = dest2.encode("utf-16le")
+    upload_flag_pkt = struct.pack("<BBIQH", OP_UPLOAD_SINGLE, 0x03, 202, 512, len(dest2_b)) + dest2_b
+    handler.handle_command(upload_flag_pkt)
+    handler._active_uploads[202]["file"].close()
+    handler._active_uploads[202]["file"] = _failing_file(OSError(errno.EACCES, "Denied"))
+
+    replies_flag = handler.handle_command(encode_file_chunk(item_id=202, chunk_index=1, total_chunks=1, chunk_data=b"xyz"))
+    assert len(replies_flag) == 1
+    assert replies_flag[0][0] == REPLY_UPLOAD_BATCH_ERROR
+    assert decode_reply(replies_flag[0])["win32_error"] == 5
+
+    # 3. Single-file upload (no batch context) still emits 0xA5
+    handler.handle_command(encode_upload_single("C:\\single.bin", file_size=512, req_id=203, overwrite=True))
+    handler._active_uploads[203]["file"].close()
+    handler._active_uploads[203]["file"] = _failing_file(OSError(errno.ENOSPC, "No space"))
+
+    replies_single = handler.handle_command(encode_file_chunk(item_id=203, chunk_index=1, total_chunks=1, chunk_data=b"123"))
+    assert len(replies_single) == 1
+    assert replies_single[0][0] == REPLY_UPLOAD_ERROR
