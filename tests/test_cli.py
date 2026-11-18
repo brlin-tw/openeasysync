@@ -98,7 +98,7 @@ def test_cli_put_and_get_report_progress(tmp_path, capsys):
     local_dir = tmp_path / "folder"
     local_dir.mkdir()
 
-    def _fake_upload_file(src, dst, progress_callback=None):
+    def _fake_upload_file(src, dst, overwrite=False, progress_callback=None):
         assert progress_callback is not None
         progress_callback(512, 1024)
         progress_callback(1024, 1024)
@@ -141,3 +141,28 @@ def test_cli_put_and_get_report_progress(tmp_path, capsys):
         out_get = capsys.readouterr().out
         assert "100.0%" in out_get
         assert "KB/s" in out_get or "MB/s" in out_get
+
+
+def test_cli_put_force_overwrite_flag(tmp_path):
+    """Verify 'put -f' / 'put --force' passes overwrite=True to upload_file."""
+    local_file = tmp_path / "demo.bin"
+    local_file.write_bytes(b"X" * 16)
+
+    mock_transport = MagicMock()
+    mock_session = MagicMock()
+    mock_transfer = MagicMock()
+    mock_transfer.upload_file.return_value = True
+
+    with (
+        patch("openeasysync.cli.main.detect_device", return_value=mock_transport),
+        patch("openeasysync.cli.main.SessionManager", return_value=mock_session),
+        patch("openeasysync.cli.main.TransferManager", return_value=mock_transfer),
+    ):
+        assert main(["put", str(local_file), "C:\\demo.bin"]) == 0
+        assert mock_transfer.upload_file.call_args.kwargs["overwrite"] is False
+
+        assert main(["put", "-f", str(local_file), "C:\\demo.bin"]) == 0
+        assert mock_transfer.upload_file.call_args.kwargs["overwrite"] is True
+
+        assert main(["put", "--force", str(local_file), "C:\\demo.bin"]) == 0
+        assert mock_transfer.upload_file.call_args.kwargs["overwrite"] is True

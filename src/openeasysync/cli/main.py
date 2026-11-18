@@ -194,12 +194,15 @@ def cmd_put(args) -> int:
     try:
         local_p = args.local_path
         remote_p = args.remote_path
+        force = bool(getattr(args, "force", False))
         if os.path.isdir(local_p):
             print(f"Batch uploading directory '{local_p}' -> '{remote_p}'...")
             success = transfer.upload_batch([local_p], remote_p, progress_callback=reporter)
         else:
             print(f"Uploading file '{local_p}' -> '{remote_p}'...")
-            success = transfer.upload_file(local_p, remote_p, progress_callback=reporter)
+            success = transfer.upload_file(
+                local_p, remote_p, overwrite=force, progress_callback=reporter
+            )
         reporter.finish()
 
         if success:
@@ -322,6 +325,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # put
     p_put = subparsers.add_parser("put", help="Upload a file or directory to remote peer")
+    p_put.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Overwrite existing file on the remote destination path",
+    )
     p_put.add_argument("local_path", help="Local source path")
     p_put.add_argument("remote_path", help="Remote destination path")
     p_put.set_defaults(func=cmd_put)
