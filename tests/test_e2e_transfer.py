@@ -590,3 +590,84 @@ def test_server_handler_emits_0xa9_on_batch_chunk_write_failure(tmp_path):
     replies_single = handler.handle_command(encode_file_chunk(item_id=203, chunk_index=1, total_chunks=1, chunk_data=b"123"))
     assert len(replies_single) == 1
     assert replies_single[0][0] == REPLY_UPLOAD_ERROR
+
+
+def test_upload_batch_sends_clear_readonly_on_conflict(tmp_path):
+    """Verify upload_batch sends 0x12 OP_BATCH_CLEAR_READONLY for conflicting items before streaming."""
+    from unittest.mock import MagicMock
+
+    from openeasysync.constants import (
+        OP_BATCH_CLEAR_READONLY,
+        OP_PRECHECK_BATCH_EXT,
+        OP_UPLOAD_SINGLE,
+        STATUS_OK,
+    )
+    from openeasysync.protocol.commands import decode_command
+    from openeasysync.protocol.replies import (
+        encode_precheck_batch_ext_reply,
+        encode_status_ack,
+    )
+
+    src_file = tmp_path / "conflict.txt"
+    src_file.write_bytes(b"new content")
+
+    sent_opcodes: list[int] = []
+    clear_cmd_records: list[tuple[int, str]] = []
+
+    def _fake_send_command(packet: bytes, expected_opcodes=None) -> bytes:
+        opcode = packet[0]
+        sent_opcodes.append(opcode)
+        if opcode == OP_PRECHECK_BATCH_EXT:
+            cmd = decode_command(packet)
+            conflict_ids = [item_id for item_id, _path in cmd["records"]]
+            return encode_precheck_batch_ext_reply(
+                conflict_ids, req_id=cmd["req_id"]
+            )
+        if opcode == OP_BATCH_CLEAR_READONLY:
+            cmd = decode_command(packet)
+            clear_cmd_records.extend(cmd["records"])
+            return encode_status_ack(STATUS_OK, req_opcode=OP_BATCH_CLEAR_READONLY, req_id=cmd["req_id"])
+        if opcode == OP_UPLOAD_SINGLE:
+            return encode_status_ack(STATUS_OK, req_opcode=OP_UPLOAD_SINGLE, req_id=1)
+        return encode_status_ack(STATUS_OK, req_opcode=opcode, req_id=1)
+
+    mock_session = MagicMock()
+    mock_session.send_command.side_effect = _fake_send_command
+
+    transfer = TransferManager(mock_session)
+    assert transfer.upload_batch([str(src_file)], "C:\\dest", overwrite=True) is True
+
+    assert OP_PRECHECK_BATCH_EXT in sent_opcodes
+    assert OP_BATCH_CLEAR_READONLY in sent_opcodes
+    assert sent_opcodes.index(OP_PRECHECK_BATCH_EXT) < sent_opcodes.index(OP_BATCH_CLEAR_READONLY)
+    assert sent_opcodes.index(OP_BATCH_CLEAR_READONLY) < sent_opcodes.index(OP_UPLOAD_SINGLE)
+    assert len(clear_cmd_records) == 1
+    assert clear_cmd_records[0][1] == "C:\\dest\\conflict.txt"
+
+
+def test_e2e_batch_upload_overwrite_readonly_destination(dual_host_setup):
+    """Verify upload_batch clears read-only attributes (0x12) and overwrites read-only destination files."""
+    import os
+
+    dir_a = dual_host_setup["dir_a"]
+    dir_b = dual_host_setup["dir_b"]
+    transfer_a = dual_host_setup["transfer_a"]
+
+    dest_dir = dir_b / "ro_target"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_file = dest_dir / "readonly.txt"
+    dest_file.write_bytes(b"old readonly content")
+    os.chmod(dest_file, 0o444)
+
+    src_file = dir_a / "readonly.txt"
+    src_file.write_bytes(b"updated content")
+
+    try:
+        assert transfer_a.upload_batch([str(src_file)], "C:\\ro_target", overwrite=True) is True
+        dual_host_setup["session_b"].wait_settled(
+            quiet_interval_s=0.05, timeout_s=2.0, min_settle_s=0.02
+        )
+        assert dest_file.read_bytes() == b"updated content"
+    finally:
+        if dest_file.exists():
+            os.chmod(dest_file, 0o644)
