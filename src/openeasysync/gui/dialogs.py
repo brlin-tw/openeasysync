@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from openeasysync.client.transfer import format_rate
+
 
 class ProgressDialog(QDialog):
     """Modal transfer progress dialog (Spec Part 3 Dialog ID 131)."""
@@ -54,11 +56,25 @@ class ProgressDialog(QDialog):
         self.lbl_src.setText(f"Source: {src}")
         self.lbl_dest.setText(f"Destination: {dest}")
 
-    def update_progress(self, current: int, total: int, rate_kbs: float = 0.0) -> None:
+    def update_progress(
+        self, current: int, total: int, rate_kbs: float = 0.0, filename: str = ""
+    ) -> None:
+        rate_str = format_rate(rate_kbs)
         if total > 0:
-            pct = int((current / total) * 100)
-            self.progress_bar.setValue(min(100, max(0, pct)))
-        self.lbl_speed.setText(f"{current} / {total} bytes ({rate_kbs:.1f} KB/s)")
+            self.progress_bar.setRange(0, 100)
+            pct = min(100, max(0, int((current / total) * 100)))
+            self.progress_bar.setValue(pct)
+            text = f"{pct}% — {current:,} / {total:,} bytes ({rate_str})"
+        elif current > 0:
+            self.progress_bar.setRange(0, 0)
+            text = f"{current:,} bytes ({rate_str})"
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+            text = f"0% — 0 / 0 bytes ({rate_str})"
+        if filename:
+            text += f" — {filename}"
+        self.lbl_speed.setText(text)
 
     def _on_cancel(self) -> None:
         self.btn_cancel.setEnabled(False)

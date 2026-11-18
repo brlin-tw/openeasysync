@@ -391,3 +391,126 @@ def test_session_catches_async_0xa5_and_0xa9_and_aborts_upload(tmp_path):
 
     assert len(sent_packets) == 1
     assert sent_packets[0][0] == OP_FILE_CHUNK
+
+
+def test_flush_tx_resets_timeout_on_progress():
+    """Verify flush_tx() does not time out while tx_queue is actively draining."""
+    import threading
+    import time
+    from unittest.mock import MagicMock
+
+    session = SessionManager(MagicMock())
+    session._running = True
+    for _ in range(5):
+        session.poller.enqueue_tx(b"x" * 64)
+
+    def _drain() -> None:
+        for _ in range(5):
+            time.sleep(0.02)
+            with session.poller._lock:
+                if session.poller._tx_deque:
+                    session.poller._tx_deque.popleft()
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+
+    # Total drain time (~0.10 s) exceeds timeout (0.05 s), but each step makes progress
+    session.flush_tx(timeout=0.05)
+    t.join(timeout=1.0)
+    assert session.poller.tx_queue.empty()
+
+
+def test_flush_tx_times_out_when_stalled():
+    """Verify flush_tx() raises TimeoutError when tx_queue makes no progress."""
+    from unittest.mock import MagicMock
+
+    session = SessionManager(MagicMock())
+    session._running = True
+    session.poller.enqueue_tx(b"x" * 64)
+
+    with pytest.raises(TimeoutError, match="Timeout waiting for TX queue to drain"):
+        session.flush_tx(timeout=0.03)
+
+
+def test_send_packet_applies_tx_backpressure():
+    """Verify send_packet() blocks while tx_queue >= MAX_TX_QUEUE_BLOCKS and unblocks on drain."""
+    import threading
+    import time
+    from unittest.mock import MagicMock
+
+    from openeasysync.client.session import MAX_TX_QUEUE_BLOCKS
+
+    session = SessionManager(MagicMock())
+    session._running = True
+    for _ in range(MAX_TX_QUEUE_BLOCKS):
+        session.poller.enqueue_tx(b"x" * 64)
+
+    def _drain_one() -> None:
+        time.sleep(0.03)
+        with session.poller._lock:
+            session.poller._tx_deque.popleft()
+
+    t = threading.Thread(target=_drain_one, daemon=True)
+    t.start()
+
+    start = time.monotonic()
+    session.send_packet(b"\x0c" + b"\x00" * 16, tx_timeout=1.0)
+    elapsed = time.monotonic() - start
+    t.join(timeout=1.0)
+
+    assert elapsed >= 0.025
+    assert session.poller.tx_queue.qsize() == MAX_TX_QUEUE_BLOCKS
+
+
+def test_speed_tracker_and_format_rate(monkeypatch):
+    """Verify SpeedTracker computes KB/s and format_rate switches between KB/s and MB/s."""
+    from openeasysync.client.transfer import SpeedTracker, format_rate
+
+    ticks = iter([100.0, 102.0])
+    monkeypatch.setattr("openeasysync.client.transfer.time.monotonic", lambda: next(ticks))
+    tracker = SpeedTracker()
+    assert tracker.rate_kbs(0) == 0.0
+    assert tracker.rate_kbs(2048 * 1024) == pytest.approx(1024.0)
+    assert format_rate(512.34) == "512.3 KB/s"
+    assert format_rate(2048.0) == "2.00 MB/s"
+
+
+def test_e2e_batch_upload_and_download_progress_callbacks(dual_host_setup):
+    """Verify upload_batch and download_batch invoke progress_callback with cumulative bytes and filename."""
+    dir_a = dual_host_setup["dir_a"]
+    dir_b = dual_host_setup["dir_b"]
+    transfer_a = dual_host_setup["transfer_a"]
+
+    src_dir = dir_a / "batch_prog"
+    src_dir.mkdir()
+    (src_dir / "a.bin").write_bytes(b"A" * 70000)
+    (src_dir / "b.bin").write_bytes(b"B" * 10000)
+    total_expected = 80000
+
+    up_calls: list[tuple[int, int, str]] = []
+    assert transfer_a.upload_batch(
+        [str(src_dir)],
+        "C:\\",
+        progress_callback=lambda cur, tot, name: up_calls.append((cur, tot, name)),
+    )
+    assert up_calls
+    assert all(tot == total_expected for _, tot, _ in up_calls)
+    assert up_calls[-1][0] == total_expected
+    assert [c[0] for c in up_calls] == sorted(c[0] for c in up_calls)
+    assert any("a.bin" in c[2] for c in up_calls)
+    assert any("b.bin" in c[2] for c in up_calls)
+
+    dual_host_setup["session_b"].wait_settled(quiet_interval_s=0.05, timeout_s=2.0, min_settle_s=0.02)
+    assert (dir_b / "batch_prog" / "a.bin").read_bytes() == b"A" * 70000
+
+    dl_dest = dir_a / "dl_out"
+    dl_calls: list[tuple[int, int, str]] = []
+    assert transfer_a.download_batch(
+        ["C:\\batch_prog"],
+        str(dl_dest),
+        progress_callback=lambda cur, tot, name: dl_calls.append((cur, tot, name)),
+    )
+    assert dl_calls
+    assert dl_calls[-1][0] == total_expected
+    assert dl_calls[-1][1] == total_expected
+    assert [c[0] for c in dl_calls] == sorted(c[0] for c in dl_calls)

@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """High-level file transfer engine providing single/batch upload and download APIs."""
 
+import logging
 import os
 import struct
+import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -52,6 +54,31 @@ from openeasysync.protocol.directory_entry import (
     unix_to_filetime,
 )
 from openeasysync.protocol.replies import decode_reply, format_win32_error
+
+logger = logging.getLogger("openeasysync.transfer")
+
+
+class SpeedTracker:
+    """Tracks elapsed time and computes transfer speed in KB/s."""
+
+    def __init__(self) -> None:
+        self._start = time.monotonic()
+
+    def rate_kbs(self, current_bytes: int) -> float:
+        """Returns average transfer rate in KB/s for current_bytes transferred."""
+        if current_bytes <= 0:
+            return 0.0
+        elapsed = time.monotonic() - self._start
+        if elapsed <= 0:
+            return 0.0
+        return (current_bytes / 1024.0) / elapsed
+
+
+def format_rate(rate_kbs: float) -> str:
+    """Formats transfer rate in KB/s or MB/s."""
+    if rate_kbs >= 1024.0:
+        return f"{rate_kbs / 1024.0:.2f} MB/s"
+    return f"{rate_kbs:.1f} KB/s"
 
 
 class TransferManager:
@@ -187,6 +214,16 @@ class TransferManager:
 
         req_id = self._get_next_item_id()
         item_id = req_id
+        total_chunks = (file_size + chunk_size - 1) // chunk_size if file_size > 0 else 1
+
+        logger.debug(
+            "Starting single upload: dest=%r, file_size=%d, overwrite=%s, req_id=%d, total_chunks=%d",
+            dest_path_str,
+            file_size,
+            overwrite,
+            req_id,
+            total_chunks,
+        )
 
         # 1. Pack Opcode 0x0A: <B B I Q H
         header = struct.pack(
@@ -228,7 +265,6 @@ class TransferManager:
 
         # 3. Stream Chunks asynchronously via Opcode 0x0C without awaiting per-chunk replies
         self.session.clear_upload_error()
-        total_chunks = (file_size + chunk_size - 1) // chunk_size if file_size > 0 else 1
 
         bytes_sent = 0
         for chunk_index, chunk_data in enumerate(chunk_iter, start=1):
@@ -237,8 +273,8 @@ class TransferManager:
                 "<B I I I I",
                 OP_FILE_CHUNK,
                 item_id,
-                chunk_index,
                 total_chunks,
+                chunk_index,
                 len(chunk_data),
             )
             self.session.send_packet(chunk_header + chunk_data)
@@ -251,6 +287,7 @@ class TransferManager:
         self.session.check_upload_error()
         self.session.send_packet(struct.pack("<B I H", OP_TRANSFER_COMPLETE, item_id, 0))
         self.session.flush_tx()
+        logger.debug("Completed single upload: item_id=%d, bytes_sent=%d", item_id, bytes_sent)
         return True
 
     def _upload_bytes(
@@ -405,7 +442,7 @@ class TransferManager:
         with open(local_dest, "wb") as f:
             if initial_chunk is not None:
                 assert initial_chunk[0] == REPLY_DOWNLOAD_CHUNK
-                item_id, chunk_idx, total_chunks, chunk_len = struct.unpack_from(
+                item_id, total_chunks, chunk_idx, chunk_len = struct.unpack_from(
                     "<I I I I", initial_chunk, 1
                 )
                 chunk_data = initial_chunk[17 : 17 + chunk_len]
@@ -413,13 +450,13 @@ class TransferManager:
                 bytes_received += len(chunk_data)
                 if progress_callback:
                     progress_callback(bytes_received, file_size)
-                if chunk_idx + 1 >= total_chunks:
+                if chunk_idx >= total_chunks:
                     return
 
             while True:
                 chunk_pkt = self.session.recv_reply(timeout=15.0)
                 assert chunk_pkt[0] == REPLY_DOWNLOAD_CHUNK
-                item_id, chunk_idx, total_chunks, chunk_len = struct.unpack_from(
+                item_id, total_chunks, chunk_idx, chunk_len = struct.unpack_from(
                     "<I I I I", chunk_pkt, 1
                 )
                 chunk_data = chunk_pkt[17 : 17 + chunk_len]
@@ -427,7 +464,7 @@ class TransferManager:
                 bytes_received += len(chunk_data)
                 if progress_callback:
                     progress_callback(bytes_received, file_size)
-                if chunk_idx + 1 >= total_chunks:
+                if chunk_idx >= total_chunks:
                     break
 
     def upload_batch(
@@ -523,6 +560,8 @@ class TransferManager:
                         filtered_records.append(r)
                 records = filtered_records
 
+        total_bytes = sum(r.find_data.file_size for r in records if not r.find_data.is_directory)
+        transferred_bytes = 0
         zero_files: list[tuple[int, str]] = []
         for rec in records:
             remote_target = os.path.join(remote_base_dir, rec.rel_path).replace("/", "\\")
@@ -534,28 +573,42 @@ class TransferManager:
                 parent = os.path.dirname(remote_target)
                 if parent:
                     self.create_dir(parent)
-                if not self._upload_bytes(remote_target, rec.data, overwrite=True):
+                file_cb = (
+                    (
+                        lambda cur, _tot, base=transferred_bytes, name=rec.rel_path: (
+                            progress_callback(base + cur, total_bytes, name)
+                        )
+                    )
+                    if progress_callback
+                    else None
+                )
+                if not self._upload_bytes(
+                    remote_target, rec.data, overwrite=True, progress_callback=file_cb
+                ):
                     return False
+                transferred_bytes += rec.find_data.file_size
 
         if zero_files:
             z_cmd = encode_create_batch_zero_files(zero_files, req_id=self._get_next_item_id())
             z_rep = decode_reply(self.session.send_command(z_cmd, expected_opcodes=(REPLY_STATUS_ACK,)))
             if z_rep.get("status") != STATUS_OK:
                 return False
+        if progress_callback and total_bytes == 0:
+            progress_callback(0, 0, "")
         return True
 
     def _collect_remote_batch_items(
         self, remote_paths: list[str], local_dest_dir: str
-    ) -> list[tuple[int, str, str, bool]]:
-        """Expands remote_paths into (item_id, remote_path, local_path, is_dir) tuples."""
-        items: list[tuple[int, str, str, bool]] = []
+    ) -> list[tuple[int, str, str, bool, int]]:
+        """Expands remote_paths into (item_id, remote_path, local_path, is_dir, file_size) tuples."""
+        items: list[tuple[int, str, str, bool, int]] = []
         for rp in remote_paths:
             clean_rp = rp.rstrip("\\/")
             base_name = clean_rp.replace("\\", "/").split("/")[-1]
             local_target = os.path.join(local_dest_dir, base_name)
             try:
                 entries = self.list_dir(rp)
-                items.append((self._get_next_item_id(), rp, local_target, True))
+                items.append((self._get_next_item_id(), rp, local_target, True, 0))
                 stack: list[tuple[str, str, list[Entry552]]] = [(rp, local_target, entries)]
                 while stack:
                     cur_r, cur_l, cur_entries = stack.pop()
@@ -564,12 +617,20 @@ class TransferManager:
                         child_r = f"{stripped_r}\\{entry.filename}"
                         child_l = os.path.join(cur_l, entry.filename)
                         if entry.is_dir:
-                            items.append((self._get_next_item_id(), child_r, child_l, True))
+                            items.append((self._get_next_item_id(), child_r, child_l, True, 0))
                             stack.append((child_r, child_l, self.list_dir(child_r)))
                         else:
-                            items.append((self._get_next_item_id(), child_r, child_l, False))
+                            items.append(
+                                (
+                                    self._get_next_item_id(),
+                                    child_r,
+                                    child_l,
+                                    False,
+                                    entry.find_data.file_size,
+                                )
+                            )
             except OSError:
-                items.append((self._get_next_item_id(), rp, local_target, False))
+                items.append((self._get_next_item_id(), rp, local_target, False, 0))
         return items
 
     def download_batch(
@@ -584,15 +645,20 @@ class TransferManager:
         if not items:
             return True
 
-        id_map = {item_id: (rpath, lpath, is_dir) for item_id, rpath, lpath, is_dir in items}
+        total_bytes = sum(fsize for _id, _rp, _lp, is_dir, fsize in items if not is_dir)
+        id_map = {
+            item_id: (rpath, lpath, is_dir)
+            for item_id, rpath, lpath, is_dir, _fsize in items
+        }
         req_id = self._get_next_item_id()
         cmd = encode_download_batch(
-            [(item_id, rpath) for item_id, rpath, _lpath, _is_dir in items], req_id=req_id
+            [(item_id, rpath) for item_id, rpath, _lpath, _is_dir, _fsize in items], req_id=req_id
         )
 
         self.session.drain_replies()
         self.session.send_packet(cmd)
 
+        bytes_received = 0
         open_files: dict[int, Any] = {}
         try:
             while True:
@@ -603,14 +669,18 @@ class TransferManager:
                 if op == REPLY_DOWNLOAD_CHUNK:
                     item_id = rep["item_id"]
                     if item_id in id_map:
-                        _rpath, lpath, _is_dir = id_map[item_id]
+                        rpath, lpath, _is_dir = id_map[item_id]
                         if item_id not in open_files:
                             parent = os.path.dirname(lpath)
                             if parent:
                                 os.makedirs(parent, exist_ok=True)
                             open_files[item_id] = open(lpath, "wb")
-                        open_files[item_id].write(rep["data"])
-                        if rep["chunk_index"] + 1 >= rep["total_chunks"]:
+                        chunk_data = rep["data"]
+                        open_files[item_id].write(chunk_data)
+                        bytes_received += len(chunk_data)
+                        if progress_callback:
+                            progress_callback(bytes_received, total_bytes, rpath)
+                        if rep["chunk_index"] >= rep["total_chunks"]:
                             open_files.pop(item_id).close()
 
                 elif op == REPLY_DOWNLOAD_BATCH_EMPTY:
@@ -630,6 +700,8 @@ class TransferManager:
                     continue
 
                 elif op == REPLY_DOWNLOAD_BATCH_DONE:
+                    if progress_callback and total_bytes == 0:
+                        progress_callback(0, 0, "")
                     return rep.get("status", 0) == 0
         finally:
             for f in open_files.values():

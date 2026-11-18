@@ -171,21 +171,85 @@ def test_main_window_upload_uses_inline_overwrite_check(qapp, tmp_path, monkeypa
     # Case 1: New file succeeds on first upload_file(..., overwrite=False)
     win.transfer.upload_file = MagicMock(return_value=True)
     win._on_upload_clicked()
-    win.transfer.upload_file.assert_called_once_with(str(local_file), "C:\\Dest\\sample.txt", overwrite=False)
+    win.transfer.upload_file.assert_called_once()
+    assert win.transfer.upload_file.call_args.args == (str(local_file), "C:\\Dest\\sample.txt")
+    assert win.transfer.upload_file.call_args.kwargs["overwrite"] is False
+    assert callable(win.transfer.upload_file.call_args.kwargs["progress_callback"])
 
     # Case 2: Existing file raises FileExistsError, user confirms replacement -> overwrite=True
     win.transfer.upload_file = MagicMock(side_effect=[FileExistsError("exists"), True])
     monkeypatch.setattr(ConfirmReplaceDialog, "exec", lambda self: 1)
     win._on_upload_clicked()
     assert win.transfer.upload_file.call_count == 2
-    assert win.transfer.upload_file.call_args_list[0].kwargs == {"overwrite": False}
-    assert win.transfer.upload_file.call_args_list[1].kwargs == {"overwrite": True}
+    assert win.transfer.upload_file.call_args_list[0].kwargs["overwrite"] is False
+    assert win.transfer.upload_file.call_args_list[1].kwargs["overwrite"] is True
 
     # Case 3: Existing file raises FileExistsError, user cancels -> no second upload_file call
     win.transfer.upload_file = MagicMock(side_effect=FileExistsError("exists"))
     monkeypatch.setattr(ConfirmReplaceDialog, "exec", lambda self: 0)
     win._on_upload_clicked()
-    win.transfer.upload_file.assert_called_once_with(str(local_file), "C:\\Dest\\sample.txt", overwrite=False)
+    win.transfer.upload_file.assert_called_once()
+    assert win.transfer.upload_file.call_args.kwargs["overwrite"] is False
+
+    win.close()
+    win.deleteLater()
+
+
+def test_main_window_shows_progress_dialog_with_percentage_and_speed(qapp, tmp_path, monkeypatch):
+    """Verify upload and download display ProgressDialog and update percentage and speed."""
+    from unittest.mock import MagicMock
+
+    local_file = tmp_path / "up.bin"
+    local_file.write_bytes(b"A" * 2048)
+
+    cable = MockBridgeCable()
+    t_a, _ = cable.create_pair()
+    session = SessionManager(t_a)
+    monkeypatch.setattr(SessionManager, "is_connected", property(lambda self: True))
+
+    win = MainWindow(session=session)
+    win.local_current_path = str(tmp_path)
+    win.remote_current_path = "C:\\Dest"
+    win.refresh_local()
+    win.local_pane.table.setCurrentCell(0, 0)
+    win.remote_pane.set_entries(
+        "C:\\Dest", [make_file_entry("down.bin", size=4096, is_dir=False)]
+    )
+    win.remote_pane.table.setCurrentCell(0, 0)
+
+    win.refresh_remote = MagicMock()
+    win.refresh_local = MagicMock()
+
+    seen_dialogs: list[ProgressDialog] = []
+    orig_exec = ProgressDialog.exec
+
+    def _spy_exec(self):
+        seen_dialogs.append(self)
+        return orig_exec(self)
+
+    monkeypatch.setattr(ProgressDialog, "exec", _spy_exec)
+
+    def _fake_upload(src, dst, overwrite=False, progress_callback=None):
+        progress_callback(1024, 2048)
+        progress_callback(2048, 2048)
+        return True
+
+    def _fake_download(src, dst, progress_callback=None):
+        progress_callback(2048, 4096)
+        progress_callback(4096, 4096)
+        return True
+
+    win.transfer.upload_file = MagicMock(side_effect=_fake_upload)
+    win.transfer.download_file = MagicMock(side_effect=_fake_download)
+
+    win._on_upload_clicked()
+    win._on_download_clicked()
+
+    assert len(seen_dialogs) == 2
+    for dlg in seen_dialogs:
+        assert dlg.progress_bar.value() == 100
+        assert "100%" in dlg.lbl_speed.text()
+        assert ("KB/s" in dlg.lbl_speed.text()) or ("MB/s" in dlg.lbl_speed.text())
 
     win.close()
     win.deleteLater()

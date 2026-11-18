@@ -9,7 +9,7 @@ import sys
 import time
 
 from openeasysync.client.session import SessionManager
-from openeasysync.client.transfer import TransferManager
+from openeasysync.client.transfer import SpeedTracker, TransferManager, format_rate
 from openeasysync.constants import SPEED_USB20
 from openeasysync.transport.detector import detect_device, list_connected_devices
 
@@ -144,6 +144,40 @@ def cmd_ls(args) -> int:
         session.disconnect()
 
 
+class _CliProgressReporter:
+    """Renders upload/download percentage and speed updates to stdout."""
+
+    def __init__(self, is_tty: bool | None = None, min_interval_s: float = 0.1) -> None:
+        self._tracker = SpeedTracker()
+        self._is_tty = sys.stdout.isatty() if is_tty is None else is_tty
+        self._min_interval_s = min_interval_s
+        self._last_print = 0.0
+        self._printed_line = False
+
+    def __call__(self, current: int, total: int, filename: str = "") -> None:
+        now = time.monotonic()
+        done = total == 0 or current >= total
+        if not done and (now - self._last_print) < self._min_interval_s:
+            return
+        self._last_print = now
+
+        pct = 100.0 if total == 0 else min(100.0, (current / total) * 100.0)
+        rate_str = format_rate(self._tracker.rate_kbs(current))
+        suffix = f" {filename}" if filename else ""
+        msg = f"Progress: {pct:5.1f}% ({current}/{total} B) {rate_str}{suffix}"
+        if self._is_tty:
+            print(f"\r{msg:<72}", end="", flush=True)
+            self._printed_line = True
+        elif done or not self._printed_line:
+            print(msg, flush=True)
+            self._printed_line = True
+
+    def finish(self) -> None:
+        if self._is_tty and self._printed_line:
+            print(flush=True)
+            self._printed_line = False
+
+
 def cmd_put(args) -> int:
     """Uploads a local file or directory to remote peer."""
     device_spec = getattr(args, "device", None)
@@ -155,16 +189,18 @@ def cmd_put(args) -> int:
     session = SessionManager(transport)
     session.connect()
     transfer = TransferManager(session)
+    reporter = _CliProgressReporter()
 
     try:
         local_p = args.local_path
         remote_p = args.remote_path
         if os.path.isdir(local_p):
             print(f"Batch uploading directory '{local_p}' -> '{remote_p}'...")
-            success = transfer.upload_batch([local_p], remote_p)
+            success = transfer.upload_batch([local_p], remote_p, progress_callback=reporter)
         else:
             print(f"Uploading file '{local_p}' -> '{remote_p}'...")
-            success = transfer.upload_file(local_p, remote_p)
+            success = transfer.upload_file(local_p, remote_p, progress_callback=reporter)
+        reporter.finish()
 
         if success:
             print("Transfer completed successfully.")
@@ -173,6 +209,7 @@ def cmd_put(args) -> int:
             print("Transfer failed or was cancelled.", file=sys.stderr)
             return 1
     except Exception as exc:
+        reporter.finish()
         print(f"Error during transfer: {exc}", file=sys.stderr)
         return 1
     finally:
@@ -190,12 +227,14 @@ def cmd_get(args) -> int:
     session = SessionManager(transport)
     session.connect()
     transfer = TransferManager(session)
+    reporter = _CliProgressReporter()
 
     try:
         remote_p = args.remote_path
         local_p = args.local_path
         print(f"Downloading '{remote_p}' -> '{local_p}'...")
-        success = transfer.download_file(remote_p, local_p)
+        success = transfer.download_file(remote_p, local_p, progress_callback=reporter)
+        reporter.finish()
         if success:
             print("Download completed successfully.")
             return 0
@@ -203,6 +242,7 @@ def cmd_get(args) -> int:
             print("Download failed.", file=sys.stderr)
             return 1
     except Exception as exc:
+        reporter.finish()
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:

@@ -89,3 +89,55 @@ def test_cli_rm_exception_disconnects():
 
     assert rc == 1
     mock_session.disconnect.assert_called_once()
+
+
+def test_cli_put_and_get_report_progress(tmp_path, capsys):
+    """Verify 'put' (file and dir) and 'get' pass progress_callback and print percentage and speed."""
+    local_file = tmp_path / "demo.bin"
+    local_file.write_bytes(b"X" * 1024)
+    local_dir = tmp_path / "folder"
+    local_dir.mkdir()
+
+    def _fake_upload_file(src, dst, progress_callback=None):
+        assert progress_callback is not None
+        progress_callback(512, 1024)
+        progress_callback(1024, 1024)
+        return True
+
+    def _fake_upload_batch(srcs, dst, progress_callback=None):
+        assert progress_callback is not None
+        progress_callback(2048, 2048, "item.txt")
+        return True
+
+    def _fake_download_file(src, dst, progress_callback=None):
+        assert progress_callback is not None
+        progress_callback(1024, 2048)
+        progress_callback(2048, 2048)
+        return True
+
+    mock_transport = MagicMock()
+    mock_session = MagicMock()
+    mock_transfer = MagicMock()
+    mock_transfer.upload_file.side_effect = _fake_upload_file
+    mock_transfer.upload_batch.side_effect = _fake_upload_batch
+    mock_transfer.download_file.side_effect = _fake_download_file
+
+    with (
+        patch("openeasysync.cli.main.detect_device", return_value=mock_transport),
+        patch("openeasysync.cli.main.SessionManager", return_value=mock_session),
+        patch("openeasysync.cli.main.TransferManager", return_value=mock_transfer),
+    ):
+        assert main(["put", str(local_file), "C:\\demo.bin"]) == 0
+        out_put_file = capsys.readouterr().out
+        assert "100.0%" in out_put_file
+        assert "KB/s" in out_put_file or "MB/s" in out_put_file
+
+        assert main(["put", str(local_dir), "C:\\"]) == 0
+        out_put_dir = capsys.readouterr().out
+        assert "100.0%" in out_put_dir
+        assert "item.txt" in out_put_dir
+
+        assert main(["get", "C:\\demo.bin", str(tmp_path / "out.bin")]) == 0
+        out_get = capsys.readouterr().out
+        assert "100.0%" in out_get
+        assert "KB/s" in out_get or "MB/s" in out_get

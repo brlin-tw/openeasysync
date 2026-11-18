@@ -7,7 +7,7 @@ import os
 import posixpath
 import time
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFocusEvent, QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from openeasysync.client.session import SessionManager
-from openeasysync.client.transfer import TransferManager
+from openeasysync.client.transfer import SpeedTracker, TransferManager
 from openeasysync.constants import SPEED_USB20
 from openeasysync.gui.dialogs import AboutDialog, ConfirmReplaceDialog, ProgressDialog
 from openeasysync.protocol.directory_entry import Entry552, filetime_to_unix
@@ -159,6 +159,28 @@ class FilePane(QWidget):
                     else e.find_data.filename
                 )
                 self.navigate_requested.emit(new_path)
+
+
+class _TransferWorker(QThread):
+    """Background worker running a TransferManager operation without blocking the Qt UI."""
+
+    progress = Signal(int, int, str)
+    succeeded = Signal(bool)
+    failed = Signal(object)
+
+    def __init__(self, transfer_fn, parent=None):
+        super().__init__(parent)
+        self._transfer_fn = transfer_fn
+
+    def run(self) -> None:
+        def _emit_progress(current: int, total: int, filename: str = "") -> None:
+            self.progress.emit(current, total, filename)
+
+        try:
+            result = self._transfer_fn(_emit_progress)
+            self.succeeded.emit(bool(result))
+        except Exception as exc:
+            self.failed.emit(exc)
 
 
 class MainWindow(QMainWindow):
@@ -390,6 +412,45 @@ class MainWindow(QMainWindow):
         self.refresh_local()
         self.refresh_remote()
 
+    def _run_transfer_with_dialog(
+        self, src: str, dest: str, transfer_fn
+    ) -> tuple[bool, Exception | None]:
+        """Runs a transfer in a background QThread while displaying ProgressDialog."""
+        progress = ProgressDialog(parent=self)
+        progress.set_paths(src, dest)
+        tracker = SpeedTracker()
+        worker = _TransferWorker(transfer_fn, parent=self)
+        outcome: dict[str, object] = {"ok": False, "error": None, "cancelled": False}
+
+        def _on_progress(current: int, total: int, filename: str) -> None:
+            progress.update_progress(current, total, tracker.rate_kbs(current), filename)
+
+        def _on_succeeded(ok: bool) -> None:
+            outcome["ok"] = ok
+            progress.accept()
+
+        def _on_failed(exc: Exception) -> None:
+            outcome["error"] = exc
+            progress.reject()
+
+        def _on_cancelled() -> None:
+            outcome["cancelled"] = True
+            if self.transfer:
+                self.transfer.cancel_transfer()
+
+        worker.progress.connect(_on_progress)
+        worker.succeeded.connect(_on_succeeded)
+        worker.failed.connect(_on_failed)
+        progress.cancelled.connect(_on_cancelled)
+
+        QTimer.singleShot(0, worker.start)
+        progress.exec()
+        worker.wait()
+
+        if outcome["cancelled"]:
+            return False, None
+        return bool(outcome["ok"]), outcome["error"]  # type: ignore[return-value]
+
     def _on_upload_clicked(self) -> None:
         entry = self.local_pane.get_selected_entry()
         if not entry:
@@ -407,32 +468,48 @@ class MainWindow(QMainWindow):
             else f"C:\\{entry.find_data.filename}"
         )
 
-        progress = ProgressDialog(parent=self)
-        progress.set_paths(src_path, dest_remote)
+        if entry.is_dir:
+            ok, exc = self._run_transfer_with_dialog(
+                src_path,
+                dest_remote,
+                lambda cb: self.transfer.upload_batch(
+                    [src_path], self.remote_current_path or "C:\\", progress_callback=cb
+                ),
+            )
+        else:
+            ok, exc = self._run_transfer_with_dialog(
+                src_path,
+                dest_remote,
+                lambda cb: self.transfer.upload_file(
+                    src_path, dest_remote, overwrite=False, progress_callback=cb
+                ),
+            )
+            if isinstance(exc, FileExistsError):
+                dlg = ConfirmReplaceDialog(
+                    filename=entry.find_data.filename,
+                    existing_size=entry.find_data.file_size,
+                    existing_date="existing",
+                    new_size=entry.find_data.file_size,
+                    new_date="new",
+                    parent=self,
+                )
+                res = dlg.exec()
+                if res in (0, -1):
+                    return
+                ok, exc = self._run_transfer_with_dialog(
+                    src_path,
+                    dest_remote,
+                    lambda cb: self.transfer.upload_file(
+                        src_path, dest_remote, overwrite=True, progress_callback=cb
+                    ),
+                )
 
-        try:
-            if entry.is_dir:
-                self.transfer.upload_batch([src_path], self.remote_current_path or "C:\\")
-            else:
-                try:
-                    self.transfer.upload_file(src_path, dest_remote, overwrite=False)
-                except FileExistsError:
-                    dlg = ConfirmReplaceDialog(
-                        filename=entry.find_data.filename,
-                        existing_size=entry.find_data.file_size,
-                        existing_date="existing",
-                        new_size=entry.find_data.file_size,
-                        new_date="new",
-                        parent=self,
-                    )
-                    res = dlg.exec()
-                    if res in (0, -1):
-                        return
-                    self.transfer.upload_file(src_path, dest_remote, overwrite=True)
+        if exc is not None:
+            QMessageBox.critical(self, "Upload Failed", str(exc))
+            return
+        if ok:
             self.refresh_remote()
             self.statusBar().showMessage("Upload completed.", 3000)
-        except Exception as exc:
-            QMessageBox.critical(self, "Upload Failed", str(exc))
 
     def _on_download_clicked(self) -> None:
         entry = self.remote_pane.get_selected_entry()
@@ -451,15 +528,29 @@ class MainWindow(QMainWindow):
         )
         local_dest = os.path.join(self.local_current_path, entry.find_data.filename)
 
-        try:
-            if entry.is_dir or entry.is_drive:
-                self.transfer.download_batch([remote_src], self.local_current_path)
-            else:
-                self.transfer.download_file(remote_src, local_dest)
+        if entry.is_dir or entry.is_drive:
+            ok, exc = self._run_transfer_with_dialog(
+                remote_src,
+                local_dest,
+                lambda cb: self.transfer.download_batch(
+                    [remote_src], self.local_current_path, progress_callback=cb
+                ),
+            )
+        else:
+            ok, exc = self._run_transfer_with_dialog(
+                remote_src,
+                local_dest,
+                lambda cb: self.transfer.download_file(
+                    remote_src, local_dest, progress_callback=cb
+                ),
+            )
+
+        if exc is not None:
+            QMessageBox.critical(self, "Download Failed", str(exc))
+            return
+        if ok:
             self.refresh_local()
             self.statusBar().showMessage("Download completed.", 3000)
-        except Exception as exc:
-            QMessageBox.critical(self, "Download Failed", str(exc))
 
     def _build_remote_path(self, filename: str) -> str:
         """Joins filename onto remote_current_path using the remote path style."""
