@@ -4,6 +4,7 @@
 
 import logging
 import os
+import stat
 import struct
 import time
 from collections.abc import Callable, Iterable
@@ -13,6 +14,8 @@ from openeasysync.client.session import SessionManager
 from openeasysync.constants import (
     ENTRY_KIND_DRIVE,
     FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_READONLY,
     OP_FILE_CHUNK,
     OP_TRANSFER_COMPLETE,
     OP_UPLOAD_SINGLE,
@@ -48,6 +51,7 @@ from openeasysync.protocol.commands import (
     encode_query_root,
     encode_rename_dir,
     encode_rename_file,
+    encode_set_file_attrs,
 )
 from openeasysync.protocol.directory_entry import (
     Entry552,
@@ -80,6 +84,23 @@ def format_rate(rate_kbs: float) -> str:
     if rate_kbs >= 1024.0:
         return f"{rate_kbs / 1024.0:.2f} MB/s"
     return f"{rate_kbs:.1f} KB/s"
+
+
+def _stat_to_find_data(local_path: str, filename: str | None = None) -> Win32FindData:
+    """Builds Win32FindData with FILETIME timestamps and Win32 attributes from os.stat."""
+    st = os.stat(local_path)
+    is_dir = stat.S_ISDIR(st.st_mode)
+    attrs = FILE_ATTRIBUTE_DIRECTORY if is_dir else FILE_ATTRIBUTE_NORMAL
+    if not (st.st_mode & 0o222):
+        attrs = (attrs & ~FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_READONLY
+    return Win32FindData(
+        file_attributes=attrs,
+        creation_time=unix_to_filetime(st.st_ctime),
+        last_access_time=unix_to_filetime(st.st_atime),
+        last_write_time=unix_to_filetime(st.st_mtime),
+        file_size=0 if is_dir else st.st_size,
+        filename=filename if filename is not None else os.path.basename(local_path),
+    )
 
 
 class TransferManager:
@@ -199,6 +220,24 @@ class TransferManager:
         rep = decode_reply(rep_bytes)
         return rep["opcode"] == REPLY_STATUS_ACK and rep["status"] == STATUS_OK
 
+    def _send_set_file_attrs(
+        self,
+        remote_path: str,
+        find_data: Win32FindData,
+        flush: bool = True,
+    ) -> None:
+        """Sends Opcode 0x37 to preserve remote file attributes and timestamps."""
+        pkt = encode_set_file_attrs(
+            path=remote_path,
+            attributes=find_data.file_attributes,
+            creation_time=find_data.creation_time,
+            last_access_time=find_data.last_access_time,
+            last_write_time=find_data.last_write_time,
+        )
+        self.session.send_packet(pkt)
+        if flush:
+            self.session.flush_tx()
+
     def _stream_upload(
         self,
         dest_path_str: str,
@@ -207,6 +246,7 @@ class TransferManager:
         chunk_iter: Iterable[bytes],
         chunk_size: int = 64000,
         progress_callback: Callable[[int, int], None] | None = None,
+        find_data: Win32FindData | None = None,
     ) -> bool:
         """Streams a file upload using Opcodes 0x0A (sync ACK), 0x0C (async), and 0x0E."""
         dest_path_bytes = dest_path_str.encode("utf-16le")
@@ -247,6 +287,8 @@ class TransferManager:
         req_opcode, status, reply_req_id = struct.unpack_from("<BBI", rep_bytes, 1)
 
         if status == 7:
+            if find_data is not None:
+                self._send_set_file_attrs(dest_path_str, find_data)
             if progress_callback:
                 progress_callback(0, 0)
             return True
@@ -287,6 +329,8 @@ class TransferManager:
         # 4. Finalize via Opcode 0x0E (no reply emitted) and ensure TX drains cleanly
         self.session.check_upload_error()
         self.session.send_packet(struct.pack("<B I H", OP_TRANSFER_COMPLETE, item_id, 0))
+        if find_data is not None:
+            self._send_set_file_attrs(dest_path_str, find_data, flush=False)
         self.session.flush_tx()
         logger.debug("Completed single upload: item_id=%d, bytes_sent=%d", item_id, bytes_sent)
         return True
@@ -297,6 +341,7 @@ class TransferManager:
         file_data: bytes,
         overwrite: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
+        find_data: Win32FindData | None = None,
     ) -> bool:
         """Internal helper streaming in-memory file bytes using Opcodes 0x0A, 0x0C, and 0x0E."""
         file_size = len(file_data)
@@ -317,6 +362,7 @@ class TransferManager:
             chunk_iter=_iter_slices(),
             chunk_size=chunk_size,
             progress_callback=progress_callback,
+            find_data=find_data,
         )
 
     def upload_file(
@@ -330,8 +376,9 @@ class TransferManager:
         if not os.path.isfile(local_path):
             raise FileNotFoundError(f"Local file not found: {local_path}")
 
-        file_size = os.path.getsize(local_path)
         filename = os.path.basename(local_path)
+        find_data = _stat_to_find_data(local_path, filename=filename)
+        file_size = find_data.file_size
 
         if remote_dest_path.endswith("\\") or remote_dest_path.endswith("/"):
             cleaned_dest = remote_dest_path.rstrip("\\/")
@@ -364,6 +411,7 @@ class TransferManager:
                 chunk_iter=_iter_file_chunks(),
                 chunk_size=chunk_size,
                 progress_callback=progress_callback,
+                find_data=find_data,
             )
 
     def download_file(
@@ -486,42 +534,21 @@ class TransferManager:
                 base_parent = os.path.dirname(p)
                 for root, dirs, files in os.walk(p):
                     rel_dir = os.path.relpath(root, base_parent).replace("/", "\\")
-                    stat_d = os.stat(root)
-                    fd_d = Win32FindData(
-                        file_attributes=0x10,
-                        last_write_time=unix_to_filetime(stat_d.st_mtime),
-                        filename=os.path.basename(root),
-                    )
+                    fd_d = _stat_to_find_data(root)
                     records.append(BatchUploadRecord(rel_path=rel_dir, find_data=fd_d))
 
                     for fn in files:
                         fp = os.path.join(root, fn)
-                        stat_f = os.stat(fp)
                         rel_f = os.path.relpath(fp, base_parent).replace("/", "\\")
+                        fd_f = _stat_to_find_data(fp, filename=fn)
                         with open(fp, "rb") as f:
                             data = f.read()
-                        fd_f = Win32FindData(
-                            file_attributes=128,
-                            last_write_time=unix_to_filetime(stat_f.st_mtime),
-                            last_access_time=unix_to_filetime(stat_f.st_atime),
-                            creation_time=unix_to_filetime(stat_f.st_ctime),
-                            file_size=stat_f.st_size,
-                            filename=fn,
-                        )
                         records.append(BatchUploadRecord(rel_path=rel_f, find_data=fd_f, data=data))
             else:
-                stat_f = os.stat(p)
                 fn = os.path.basename(p)
+                fd_f = _stat_to_find_data(p, filename=fn)
                 with open(p, "rb") as f:
                     data = f.read()
-                fd_f = Win32FindData(
-                    file_attributes=128,
-                    last_write_time=unix_to_filetime(stat_f.st_mtime),
-                    last_access_time=unix_to_filetime(stat_f.st_atime),
-                    creation_time=unix_to_filetime(stat_f.st_ctime),
-                    file_size=stat_f.st_size,
-                    filename=fn,
-                )
                 records.append(BatchUploadRecord(rel_path=fn, find_data=fd_f, data=data))
 
         # Pre-check disk space and conflicts (0x16), and clear read-only on overwritten targets (0x12)
@@ -579,13 +606,15 @@ class TransferManager:
 
         total_bytes = sum(r.find_data.file_size for r in records if not r.find_data.is_directory)
         transferred_bytes = 0
-        zero_files: list[tuple[int, str]] = []
+        zero_files: list[tuple[int, str, Win32FindData]] = []
+        dir_attrs: list[tuple[str, Win32FindData]] = []
         for rec in records:
             remote_target = os.path.join(remote_base_dir, rec.rel_path).replace("/", "\\")
             if rec.find_data.is_directory:
                 self.create_dir(remote_target)
+                dir_attrs.append((remote_target, rec.find_data))
             elif rec.find_data.file_size == 0:
-                zero_files.append((self._get_next_item_id(), remote_target))
+                zero_files.append((self._get_next_item_id(), remote_target, rec.find_data))
             else:
                 parent = os.path.dirname(remote_target)
                 if parent:
@@ -604,15 +633,27 @@ class TransferManager:
                     rec.data,
                     overwrite=overwrite or bool(conflict_resolver),
                     progress_callback=file_cb,
+                    find_data=rec.find_data,
                 ):
                     return False
                 transferred_bytes += rec.find_data.file_size
 
         if zero_files:
-            z_cmd = encode_create_batch_zero_files(zero_files, req_id=self._get_next_item_id())
+            z_cmd = encode_create_batch_zero_files(
+                [(item_id, path) for item_id, path, _fd in zero_files],
+                req_id=self._get_next_item_id(),
+            )
             z_rep = decode_reply(self.session.send_command(z_cmd, expected_opcodes=(REPLY_STATUS_ACK,)))
             if z_rep.get("status") != STATUS_OK:
                 return False
+            for _item_id, remote_target, fd in zero_files:
+                self._send_set_file_attrs(remote_target, fd, flush=False)
+            self.session.flush_tx()
+
+        if dir_attrs:
+            for remote_target, fd in reversed(dir_attrs):
+                self._send_set_file_attrs(remote_target, fd, flush=False)
+            self.session.flush_tx()
         if progress_callback and total_bytes == 0:
             progress_callback(0, 0, "")
         return True

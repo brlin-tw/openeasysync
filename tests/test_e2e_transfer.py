@@ -315,7 +315,13 @@ def test_upload_streams_chunks_without_waiting_for_replies(tmp_path):
     """Verify 0x0A awaits 0xA1, while 0x0C chunks and 0x0E are sent asynchronously via send_packet."""
     from unittest.mock import MagicMock
 
-    from openeasysync.constants import OP_FILE_CHUNK, OP_TRANSFER_COMPLETE, OP_UPLOAD_SINGLE
+    from openeasysync.constants import (
+        OP_FILE_CHUNK,
+        OP_SET_FILE_ATTRS,
+        OP_TRANSFER_COMPLETE,
+        OP_UPLOAD_SINGLE,
+    )
+    from openeasysync.protocol.commands import decode_command
     from openeasysync.protocol.replies import encode_status_ack
 
     src = tmp_path / "stream_test.bin"
@@ -331,9 +337,18 @@ def test_upload_streams_chunks_without_waiting_for_replies(tmp_path):
     assert mock_session.send_command.call_count == 1
     assert mock_session.send_command.call_args.args[0][0] == OP_UPLOAD_SINGLE
 
-    # 3 chunks (0x0C) + 1 completion (0x0E) sent via send_packet
+    # 3 chunks (0x0C) + 1 completion (0x0E) + 1 set_file_attrs (0x37) sent via send_packet
     sent_opcodes = [call.args[0][0] for call in mock_session.send_packet.call_args_list]
-    assert sent_opcodes == [OP_FILE_CHUNK, OP_FILE_CHUNK, OP_FILE_CHUNK, OP_TRANSFER_COMPLETE]
+    assert sent_opcodes == [
+        OP_FILE_CHUNK,
+        OP_FILE_CHUNK,
+        OP_FILE_CHUNK,
+        OP_TRANSFER_COMPLETE,
+        OP_SET_FILE_ATTRS,
+    ]
+    attrs_cmd = decode_command(mock_session.send_packet.call_args_list[-1].args[0])
+    assert attrs_cmd["path"] == "C:\\stream_test.bin"
+    assert attrs_cmd["last_write_time"] > 0
     mock_session.flush_tx.assert_called_once()
 
 
@@ -671,3 +686,75 @@ def test_e2e_batch_upload_overwrite_readonly_destination(dual_host_setup):
     finally:
         if dest_file.exists():
             os.chmod(dest_file, 0o644)
+
+
+def test_e2e_single_upload_preserves_timestamps_and_readonly(dual_host_setup):
+    """Verify single file upload preserves mtime, atime, and read-only attribute via 0x37."""
+    import os
+
+    dir_a = dual_host_setup["dir_a"]
+    dir_b = dual_host_setup["dir_b"]
+    transfer_a = dual_host_setup["transfer_a"]
+
+    target_atime = 1_650_000_000.0
+    target_mtime = 1_600_000_000.0
+
+    src_ro = dir_a / "readonly.txt"
+    src_ro.write_text("read-only payload")
+    os.utime(src_ro, (target_atime, target_mtime))
+    os.chmod(src_ro, 0o444)
+
+    src_zero = dir_a / "empty_ts.txt"
+    src_zero.write_bytes(b"")
+    os.utime(src_zero, (target_atime, target_mtime))
+
+    assert transfer_a.upload_file(str(src_ro), "C:\\readonly.txt") is True
+    assert transfer_a.upload_file(str(src_zero), "C:\\empty_ts.txt") is True
+    dual_host_setup["session_b"].wait_settled(quiet_interval_s=0.05, timeout_s=2.0, min_settle_s=0.02)
+
+    dest_ro = dir_b / "readonly.txt"
+    st_ro = dest_ro.stat()
+    assert st_ro.st_mtime == pytest.approx(target_mtime, abs=1.0)
+    assert st_ro.st_atime == pytest.approx(target_atime, abs=1.0)
+    assert (st_ro.st_mode & 0o222) == 0
+
+    dest_zero = dir_b / "empty_ts.txt"
+    st_zero = dest_zero.stat()
+    assert st_zero.st_mtime == pytest.approx(target_mtime, abs=1.0)
+    assert (st_zero.st_mode & 0o200) != 0
+
+
+def test_e2e_batch_upload_preserves_timestamps_and_readonly(dual_host_setup):
+    """Verify batch upload preserves timestamps and read-only attributes for files and zero-length files."""
+    import os
+
+    dir_a = dual_host_setup["dir_a"]
+    dir_b = dual_host_setup["dir_b"]
+    transfer_a = dual_host_setup["transfer_a"]
+
+    target_atime = 1_660_000_000.0
+    target_mtime = 1_610_000_000.0
+
+    batch_dir = dir_a / "attr_batch"
+    batch_dir.mkdir()
+    ro_file = batch_dir / "ro.dat"
+    ro_file.write_bytes(b"secret")
+    os.utime(ro_file, (target_atime, target_mtime))
+    os.chmod(ro_file, 0o444)
+
+    zero_file = batch_dir / "zero.dat"
+    zero_file.write_bytes(b"")
+    os.utime(zero_file, (target_atime, target_mtime))
+
+    assert transfer_a.upload_batch([str(batch_dir)], "C:\\") is True
+    dual_host_setup["session_b"].wait_settled(quiet_interval_s=0.05, timeout_s=2.0, min_settle_s=0.02)
+
+    dest_ro = dir_b / "attr_batch" / "ro.dat"
+    st_ro = dest_ro.stat()
+    assert st_ro.st_mtime == pytest.approx(target_mtime, abs=1.0)
+    assert st_ro.st_atime == pytest.approx(target_atime, abs=1.0)
+    assert (st_ro.st_mode & 0o222) == 0
+
+    dest_zero = dir_b / "attr_batch" / "zero.dat"
+    st_zero = dest_zero.stat()
+    assert st_zero.st_mtime == pytest.approx(target_mtime, abs=1.0)
