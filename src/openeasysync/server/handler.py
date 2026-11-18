@@ -75,6 +75,7 @@ from openeasysync.protocol.replies import (
     encode_precheck_batch_reply,
     encode_roots_reply,
     encode_status_ack,
+    encode_upload_batch_error,
     encode_upload_error,
     format_win32_error,
 )
@@ -90,6 +91,8 @@ class PeerServerHandler:
         self.peer_active_dir = ""
         self.peer_mode = PEER_MODE_WINDOWS
         self._active_uploads: dict[int, dict[str, Any]] = {}
+        self._batch_item_ids: set[int] = set()
+        self._batch_upload_paths: set[str] = set()
 
     def handle_command(self, payload: bytes) -> list[bytes]:
         """Dispatches a command payload and returns a list of reply payload(s)."""
@@ -153,6 +156,9 @@ class PeerServerHandler:
 
         if opcode in (OP_ABORT_BATCH, OP_CANCEL_SPLITTER):
             self.is_cancelled = True
+            if opcode == OP_ABORT_BATCH:
+                self._batch_item_ids.clear()
+                self._batch_upload_paths.clear()
             return []
 
         if opcode == OP_UI_NOTIFICATION:
@@ -401,6 +407,14 @@ class PeerServerHandler:
                 ]
 
         # 4. If file_size > 0 (Section 4.2.4 item 6)
+        flags = cmd.get("flags", 0)
+        is_batch = (
+            bool(flags & 0x02)
+            or (req_id in self._batch_item_ids)
+            or (local_dest in self._batch_upload_paths)
+        )
+        self._batch_item_ids.discard(req_id)
+        self._batch_upload_paths.discard(local_dest)
         try:
             parent_dir = os.path.dirname(local_dest)
             if parent_dir:
@@ -412,6 +426,7 @@ class PeerServerHandler:
                 "path": local_dest,
                 "total_bytes": file_size,
                 "written_bytes": 0,
+                "is_batch": is_batch,
             }
             return [encode_status_ack(status=STATUS_OK, req_opcode=OP_UPLOAD_SINGLE, req_id=req_id)]
         except PermissionError:
@@ -427,6 +442,11 @@ class PeerServerHandler:
                 )
             ]
 
+    def _encode_chunk_write_error(self, item_id: int, win32_error: int, is_batch: bool) -> bytes:
+        if is_batch:
+            return encode_upload_batch_error(item_id=item_id, win32_error=win32_error)
+        return encode_upload_error(item_id=item_id, win32_error=win32_error)
+
     def _handle_file_chunk(self, cmd: dict[str, Any]) -> list[bytes]:
         item_id = cmd["item_id"]
         chunk_index = cmd["chunk_index"]
@@ -434,8 +454,10 @@ class PeerServerHandler:
         chunk_data = cmd["chunk_data"]
         upload_ctx = self._active_uploads.get(item_id)
         if not upload_ctx:
+            is_batch = item_id in self._batch_item_ids
+            self._batch_item_ids.discard(item_id)
             return [
-                encode_upload_error(item_id=item_id, win32_error=6)
+                self._encode_chunk_write_error(item_id=item_id, win32_error=6, is_batch=is_batch)
             ]  # ERROR_INVALID_HANDLE
         try:
             upload_ctx["file"].write(chunk_data)
@@ -446,20 +468,28 @@ class PeerServerHandler:
                 self._active_uploads.pop(item_id, None)
             return []
         except OSError as exc:
+            is_batch = bool(upload_ctx.get("is_batch"))
             win32_err = 112 if exc.errno == errno.ENOSPC else 5
             try:
                 upload_ctx["file"].close()
             except Exception:
                 pass
             self._active_uploads.pop(item_id, None)
-            return [encode_upload_error(item_id=item_id, win32_error=win32_err)]
+            return [
+                self._encode_chunk_write_error(
+                    item_id=item_id, win32_error=win32_err, is_batch=is_batch
+                )
+            ]
         except Exception:
+            is_batch = bool(upload_ctx.get("is_batch"))
             try:
                 upload_ctx["file"].close()
             except Exception:
                 pass
             self._active_uploads.pop(item_id, None)
-            return [encode_upload_error(item_id=item_id, win32_error=112)]
+            return [
+                self._encode_chunk_write_error(item_id=item_id, win32_error=112, is_batch=is_batch)
+            ]
 
     def _handle_transfer_complete(self, cmd: dict[str, Any]) -> list[bytes]:
         item_id = cmd.get("item_id", 0)
@@ -679,6 +709,10 @@ class PeerServerHandler:
             insufficient_space = shutil.disk_usage(check_dir).free < total_size
         except OSError:
             pass
+
+        for item_id, dest_path in records:
+            self._batch_item_ids.add(item_id)
+            self._batch_upload_paths.add(self.mapper.wire_to_local(dest_path))
 
         conflict_ids = [
             item_id
