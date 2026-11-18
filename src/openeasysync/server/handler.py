@@ -6,6 +6,7 @@ import errno
 import os
 import shutil
 import sys
+from collections.abc import Callable
 from typing import Any
 
 from openeasysync.constants import (
@@ -56,7 +57,16 @@ from openeasysync.constants import (
     STATUS_UPLOAD_SINGLE_DONE,
     STATUS_ZERO_LENGTH,
 )
-from openeasysync.protocol.commands import decode_command, encode_extended_xml
+from openeasysync.protocol.commands import (
+    VNIC_CMD_ACCEPT_SWITCH,
+    VNIC_CMD_ME_SWITCH_NONE_ROUTER,
+    VNIC_CMD_ME_SWITCH_ROUTER,
+    VNIC_CMD_PLEASE_SWITCH,
+    VNIC_CMD_REJECT_SWITCH,
+    decode_command,
+    encode_extended_xml,
+    parse_extra_xml_command,
+)
 from openeasysync.protocol.directory_entry import (
     Entry552,
     filetime_to_unix,
@@ -84,8 +94,20 @@ from openeasysync.protocol.xml_msg import build_oti_msg, parse_oti_msg
 class PeerServerHandler:
     """Handles incoming Client Commands from a remote peer and returns reply payloads."""
 
-    def __init__(self, path_mapper: PathMapper | None = None):
+    def __init__(
+        self,
+        path_mapper: PathMapper | None = None,
+        *,
+        allow_vnic_switch: bool = False,
+        on_vnic_switch_request: Callable[[str], bool] | None = None,
+        on_vnic_mode_entered: Callable[[bool], None] | None = None,
+    ):
         self.mapper = path_mapper or PathMapper()
+        self.allow_vnic_switch = allow_vnic_switch
+        self.on_vnic_switch_request = on_vnic_switch_request
+        self.on_vnic_mode_entered = on_vnic_mode_entered
+        self.vnic_switch_accepted = False
+        self.vnic_peer_is_router: bool | None = None
         self.is_cancelled = False
         self.peer_active_dir = ""
         self.peer_mode = PEER_MODE_WINDOWS
@@ -193,7 +215,8 @@ class PeerServerHandler:
             return [self._handle_xml_control(cmd["xml"])]
 
         if opcode in OP_EXTENDED_XML_OPCODES:
-            return [self._handle_extended_xml(opcode, cmd.get("xml", ""))]
+            reply = self._handle_extended_xml(opcode, cmd.get("xml", ""))
+            return [reply] if reply is not None else []
 
         return [encode_error_code(1)]  # ERROR_INVALID_FUNCTION
 
@@ -555,7 +578,7 @@ class PeerServerHandler:
             chunk_size = 64000
             total_chunks = (file_size + chunk_size - 1) // chunk_size
             with open(local_src, "rb") as f:
-                for chunk_idx in range(total_chunks):
+                for chunk_idx in range(1, total_chunks + 1):
                     chunk_data = f.read(chunk_size)
                     replies.append(
                         encode_download_chunk(
@@ -612,7 +635,7 @@ class PeerServerHandler:
                 chunk_size = 64000
                 total_chunks = (file_size + chunk_size - 1) // chunk_size
                 with open(local_p, "rb") as f:
-                    for chunk_idx in range(total_chunks):
+                    for chunk_idx in range(1, total_chunks + 1):
                         chunk_data = f.read(chunk_size)
                         replies.append(
                             encode_download_chunk(
@@ -745,13 +768,33 @@ class PeerServerHandler:
 
         return encode_xml_control(reply_xml)
 
-    def _handle_extended_xml(self, opcode: int, xml_content: str) -> bytes:
+    def _handle_extended_xml(self, opcode: int, xml_content: str) -> bytes | None:
         """Handles incoming 0x32..0x39 Extended XML commands from peer."""
         if opcode in (0x32, 0x33) and not xml_content:
             return encode_status_ack(STATUS_OK)
 
-        if opcode in (OP_VNIC_SWITCH, 0x32) and "PleaseSwitchAsVirtualNIC" in xml_content:
-            return encode_extended_xml(
-                opcode, "<ExtraXmlCommand>RejectSwitchAsVirtualNIC</ExtraXmlCommand>"
+        extra_cmd = parse_extra_xml_command(xml_content) or ""
+
+        if opcode in (OP_VNIC_SWITCH, 0x32) and (
+            extra_cmd == VNIC_CMD_PLEASE_SWITCH or VNIC_CMD_PLEASE_SWITCH in xml_content
+        ):
+            accepted = (
+                self.on_vnic_switch_request(xml_content)
+                if self.on_vnic_switch_request is not None
+                else self.allow_vnic_switch
             )
+            self.vnic_switch_accepted = bool(accepted)
+            reply_cmd = VNIC_CMD_ACCEPT_SWITCH if accepted else VNIC_CMD_REJECT_SWITCH
+            return encode_extended_xml(opcode, f"<ExtraXmlCommand>{reply_cmd}</ExtraXmlCommand>")
+
+        if extra_cmd in (VNIC_CMD_ME_SWITCH_ROUTER, VNIC_CMD_ME_SWITCH_NONE_ROUTER):
+            is_router = extra_cmd == VNIC_CMD_ME_SWITCH_ROUTER
+            self.vnic_peer_is_router = is_router
+            if self.on_vnic_mode_entered is not None:
+                self.on_vnic_mode_entered(is_router)
+            return encode_extended_xml(opcode, "<ExtraXmlCommand>OK</ExtraXmlCommand>")
+
+        if extra_cmd in (VNIC_CMD_ACCEPT_SWITCH, VNIC_CMD_REJECT_SWITCH, "OK"):
+            return None
+
         return encode_extended_xml(opcode, "<ExtraXmlCommand>OK</ExtraXmlCommand>")
